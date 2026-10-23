@@ -11,8 +11,9 @@
  *   RECEIVING  – "正在接收" + local IP / ports; spawns bin/receiver
  *   SEARCHING  – "搜索中" (SSDP discovery on a background thread)
  *   FOUND      – machine list, each row offers 投屏 (mirror) / 扩展 (extend).
- *                Off Windows the extend chip stays visible but disabled:
- *                extend is the Windows virtual display, not a mirror alias.
+ *                On macOS the extend chip stays visible but disabled.
+ *                Linux launches sender --mode extend, which enables a virtual
+ *                output or fails with a visible status note.
  *   NOT_FOUND  – 继续搜索 / 手动输入ip
  *   MANUAL_IP  – type a receiver IP, then the same mode choice
  *   STREAMING  – session running (bin/sender …) + live STAT panel
@@ -52,6 +53,9 @@
 #include "theme.h"
 #include "update.h"
 #include "vdd.h"
+#ifdef __linux__
+#include "vdd_linux.h"
+#endif
 #include "version.h"
 
 #ifdef _WIN32
@@ -504,6 +508,7 @@ static std::deque<std::string> g_log_lines;
 static std::mutex              g_log_mtx;
 static LiveStats               g_stats;
 static std::mutex              g_stats_mtx;
+static std::string             g_last_child_error; /* last STAT event=error msg */
 
 static int g_hot = BTN_NONE;
 static int g_press = BTN_NONE;
@@ -1783,12 +1788,13 @@ static void addSegment(int x, int y, int w, int h, int id, bool on, int glyph)
     g_buttons.back().framed = false;
 }
 
-/** Extend chip. Off Windows it is drawn disabled — clicking it explains
- *  that virtual-display extend is Windows-only instead of launching sender
- *  with --mode extend. */
+/** Extend chip. On macOS it is drawn disabled — clicking it explains that
+ *  there is no virtual display, instead of launching sender --mode extend.
+ *  Linux and Windows both launch extend; Linux fails visibly if no virtual
+ *  output can be created. */
 static bool extendAvailable()
 {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
     return true;
 #else
     return false;
@@ -2048,14 +2054,27 @@ static void parseStatLine(const std::string &line)
             else if (k == "src") s.src = v;
             else if (k == "dst") s.dst = v;
             else if (k == "quality") s.quality = v;
-            else if (k == "event") s.event = v;
+            else             if (k == "event") s.event = v;
             else if (k == "msg") s.msg = v;
         }
         if (bar == std::string::npos) break;
         pos = bar + 1;
     }
     std::lock_guard<std::mutex> lk(g_stats_mtx);
+    if (s.event == "error" && !s.msg.empty())
+        g_last_child_error = s.msg;
     g_stats = s;
+}
+
+static std::string senderFailNote(const std::string &msg)
+{
+    if (msg == "extend_unsupported") return "扩展在此系统不可用";
+    if (msg == "vdd_unavailable" || msg == "vdd_startup_failed" || msg == "vdd_lost")
+        return "虚拟显示器未能启用";
+    if (msg == "capture_unavailable") return "无法采集画面";
+    if (msg == "encoder_open_failed") return "编码器打开失败";
+    if (msg.empty()) return "会话已结束";
+    return "会话已结束（" + msg + "）";
 }
 
 static void handleChildLine(const std::string &line)
@@ -2460,6 +2479,16 @@ static void stopChild(ChildProc &child, bool extend = false)
     waitpid(child.pid, nullptr, 0);
     child.active = false;
     stopReader(child);
+#ifdef __linux__
+    /* SIGKILL skips the sender's atexit, so the virtual output would stay. */
+    if (extend) {
+        std::cout << "强制停止：正在移除虚拟显示器...\n";
+        if (linuxVddForceDetach())
+            std::cout << "虚拟显示器已移除\n";
+        else
+            std::cout << "虚拟显示器移除失败（可能本就未激活）\n";
+    }
+#endif
 #endif
 }
 
@@ -2554,8 +2583,54 @@ static bool applyAutoStart(int enable)
     }
     return runHiddenW(sysExePath(L"schtasks.exe") + L" /delete /tn \"Mivara\" /f");
 #else
-    (void)enable;
-    return true; /* no-op outside Windows */
+    const char *xdg = std::getenv("XDG_CONFIG_HOME");
+    std::string base;
+    if (xdg && xdg[0]) base = xdg;
+    else {
+        const char *home = std::getenv("HOME");
+        if (!home || !home[0]) return false;
+        base = std::string(home) + "/.config";
+    }
+    const std::string dir = base + "/autostart";
+    const std::string path = dir + "/mivara.desktop";
+    if (!enable) {
+        if (unlink(path.c_str()) != 0 && errno != ENOENT) return false;
+        return true;
+    }
+    char exe[PATH_MAX] = {};
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return false;
+    exe[n] = 0;
+    std::string cur;
+    for (char c : dir) {
+        cur.push_back(c);
+        if (c == '/' && cur.size() > 1) {
+            if (mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST) return false;
+        }
+    }
+    if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) return false;
+    std::string exec = exe;
+    if (exec.find(' ') != std::string::npos)
+        exec = "\"" + exec + "\"";
+    const std::string body =
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Mivara\n"
+        "Comment=LAN screen mirroring\n"
+        "Exec=" + exec + "\n"
+        "Terminal=false\n"
+        "X-GNOME-Autostart-enabled=true\n"
+        "Categories=Network;Utility;\n";
+    const std::string tmp = path + ".tmp";
+    FILE *f = std::fopen(tmp.c_str(), "w");
+    if (!f) return false;
+    const size_t wrote = std::fwrite(body.data(), 1, body.size(), f);
+    std::fclose(f);
+    if (wrote != body.size() || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
 #endif
 }
 
@@ -2610,8 +2685,8 @@ static void startSearch()
  * ip/name dangling before the final status/last-used assignments. */
 static void noteExtendUnavailable()
 {
-    g_status_note = "扩展仅 Windows 可用（需要虚拟显示器）";
-    logPush("[gui] 扩展模式不可用：Linux/macOS 没有虚拟显示器，请使用投屏");
+    g_status_note = "扩展在此系统不可用";
+    logPush("[gui] 扩展模式不可用：macOS 没有虚拟显示器，请使用投屏");
 }
 
 static void launchStream(std::string ip, int port, bool extend, std::string name)
@@ -2645,6 +2720,10 @@ static void launchStream(std::string ip, int port, bool extend, std::string name
     {
         std::lock_guard<std::mutex> lk(g_stats_mtx);
         g_stats = LiveStats{};
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_stats_mtx);
+        g_last_child_error.clear();
     }
     logPush("[gui] launch sender " + ip + ":" + std::to_string(port) +
             " mode=" + (extend ? "extend" : "mirror") +
@@ -3163,7 +3242,7 @@ static void renderScreen(int mousex, int mousey)
                     drawText(g_ren, fitText(nm, g_fontS, 440), row.x + 12, row.y + 5,
                              THEME.text, g_fontS);
                     const char *modeTag = (e.mode == "extend")
-                        ? (extendAvailable() ? "扩展" : "扩展·仅Windows")
+                        ? (extendAvailable() ? "扩展" : "扩展·不可用")
                         : "投屏";
                     std::string sub = e.ip + ":" + std::to_string(e.port) + " · " +
                                       modeTag + " · " +
@@ -3233,7 +3312,7 @@ static void renderScreen(int mousex, int mousey)
                       g_fontS, ALIGN_RIGHT);
         else
             drawTextV(g_ren,
-                      extendAvailable() ? "选择投屏或扩展" : "扩展仅 Windows 可用",
+                      extendAvailable() ? "选择投屏或扩展" : "扩展在此系统不可用",
                       BODY_R, TITLE_Y + 12, THEME.textDim, g_fontS, ALIGN_RIGHT);
         for (size_t i = 0; i < devs.size() && i < 6; i++) {
             const int y = FOUND_ROW_Y0 + (int)i * FOUND_ROW_PITCH;
@@ -3663,7 +3742,11 @@ static void onButton(int id)
          * current; drop the task when it was just switched off. */
         if (want != had || want == 1) {
             if (!applyAutoStart(want))
+#ifdef _WIN32
                 g_status_note = "计划任务写入失败（需管理员）";
+#else
+                g_status_note = "开机自启动写入失败（检查 ~/.config/autostart 权限）";
+#endif
             else
                 g_status_note.clear();
         }
@@ -4016,9 +4099,17 @@ int main(int argc, char *argv[])
 
         /* child exit tracking */
         if (g_sender.active && childExited(g_sender, "sender")) {
+#ifdef __linux__
+            if (g_child_extend) linuxVddForceDetach();
+#endif
+            std::string fail;
+            {
+                std::lock_guard<std::mutex> lk(g_stats_mtx);
+                fail = g_last_child_error;
+            }
             g_child_extend = false;
             if (g_screen == SCR_STREAMING) {
-                g_status_note = "会话已结束";
+                g_status_note = senderFailNote(fail);
                 setScreen(SCR_HOME);
             }
         }

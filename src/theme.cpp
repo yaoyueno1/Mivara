@@ -4,11 +4,12 @@
  * Two hand-tuned palettes, one live Theme instance, and a platform hook for the
  * OS preference. See theme.h for provenance and the contrast budget.
  *
- * Polling policy: only Windows exposes a cheap "the user flipped the OS theme"
- * signal (one registry DWORD), so only Windows is polled from themeTick(). On
- * macOS/Linux the preference is read once — via `defaults`/`gsettings` — and
- * changing the OS theme takes effect on the next launch rather than spawning a
- * helper process every frame.
+ * Polling policy: themeTick() re-reads the preference every 2 s. Windows uses
+ * the AppsUseLightTheme registry DWORD. Linux reads the GTK settings.ini and
+ * KDE kdeglobals files (no process); gsettings is only used when those files
+ * do not say, and only under `timeout 0.3` so a dead session bus cannot freeze
+ * the frame. macOS reads `defaults`, which is a local plist and returns
+ * immediately.
  */
 #include "theme.h"
 
@@ -156,8 +157,11 @@ void themeTick(Uint32 now_ms)
 
 #else /* ── macOS / Linux ─────────────────────────────────────────────────── */
 
-/* One-shot shell query. Failure is not an error: an unreadable preference just
- * means we stay on light. */
+#include <cstdlib>
+#include <string>
+
+/* Shell query. Failure is not an error: an unreadable preference just means
+ * we stay on light. Callers must bound the command themselves. */
 static bool queryCmd(const char *cmd, const char *needle)
 {
     FILE *p = popen(cmd, "r");
@@ -169,31 +173,127 @@ static bool queryCmd(const char *cmd, const char *needle)
     return n > 0 && std::strstr(buf, needle) != nullptr;
 }
 
+static std::string configHome()
+{
+    const char *xdg = std::getenv("XDG_CONFIG_HOME");
+    if (xdg && xdg[0]) return xdg;
+    const char *home = std::getenv("HOME");
+    if (!home || !home[0]) return {};
+    return std::string(home) + "/.config";
+}
+
+static bool readText(const std::string &path, std::string &out)
+{
+    FILE *f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char buf[1024];
+    out.clear();
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+        out.append(buf, n);
+        if (out.size() > 256 * 1024) break;
+    }
+    std::fclose(f);
+    return true;
+}
+
+static std::string iniValue(const std::string &text, const char *key)
+{
+    const std::string needle = std::string(key) + "=";
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find('\n', pos);
+        std::string line = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = (nl == std::string::npos) ? text.size() : nl + 1;
+        size_t b = 0;
+        while (b < line.size() && (line[b] == ' ' || line[b] == '\t')) b++;
+        if (b >= line.size() || line[b] == '#' || line[b] == ';') continue;
+        if (line.compare(b, needle.size(), needle) != 0) continue;
+        std::string v = line.substr(b + needle.size());
+        while (!v.empty() && (v.back() == '\r' || v.back() == ' ' || v.back() == '\t'))
+            v.pop_back();
+        return v;
+    }
+    return {};
+}
+
+static bool truthy(const std::string &v)
+{
+    return v == "1" || v == "true" || v == "True" || v == "yes";
+}
+
+static bool falsy(const std::string &v)
+{
+    return v == "0" || v == "false" || v == "False" || v == "no";
+}
+
+#ifndef __APPLE__
+/* GTK and KDE write their preference to a file. A definitive answer here
+ * skips gsettings, which is the call that can block on a dead session bus. */
+static bool desktopFileDark(bool &dark)
+{
+    const std::string base = configHome();
+    if (base.empty()) return false;
+    std::string text;
+    if (readText(base + "/kdeglobals", text)) {
+        std::string scheme = iniValue(text, "ColorScheme");
+        if (!scheme.empty()) {
+            std::string low = scheme;
+            for (char &c : low)
+                if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            dark = low.find("dark") != std::string::npos;
+            return true;
+        }
+    }
+    for (const char *rel : {"/gtk-3.0/settings.ini", "/gtk-4.0/settings.ini"}) {
+        if (!readText(base + rel, text)) continue;
+        std::string prefer = iniValue(text, "gtk-application-prefer-dark-theme");
+        if (truthy(prefer)) { dark = true; return true; }
+        if (falsy(prefer)) { dark = false; return true; }
+        std::string theme = iniValue(text, "gtk-theme-name");
+        if (theme.size() >= 5) {
+            std::string low = theme;
+            for (char &c : low)
+                if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if (low.size() >= 5 && low.compare(low.size() - 5, 5, "-dark") == 0) {
+                dark = true;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+#endif
+
 bool themeSystemDark()
 {
-    /* fork+exec on the GUI thread: resolve() calls this from themeSetMode(),
-     * which main() runs before the window exists and the appearance switcher
-     * runs on every click. A slow or D-Bus-blocked gsettings would freeze the
-     * UI, so the sample is taken exactly once per process — which is also what
-     * theme.h documents for these platforms. */
-    static int cached = -1;             /* -1 unknown, 0 light, 1 dark */
-    if (cached < 0) {
-#  ifdef __APPLE__
-        cached = queryCmd("defaults read -g AppleInterfaceStyle 2>/dev/null", "Dark") ? 1 : 0;
-#  else
-        /* GNOME/GTK; other desktops simply report light. */
-        cached = queryCmd("gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null",
-                          "dark") ? 1 : 0;
-#  endif
-    }
-    return cached == 1;
+#ifdef __APPLE__
+    return queryCmd("defaults read -g AppleInterfaceStyle 2>/dev/null", "Dark");
+#else
+    bool dark = false;
+    if (desktopFileDark(dark)) return dark;
+    /* timeout(1) is GNU coreutils. If it is missing, skip gsettings rather
+     * than risk a stuck bus on the UI thread. */
+    static int have_timeout = -1;
+    if (have_timeout < 0)
+        have_timeout = queryCmd("command -v timeout 2>/dev/null", "timeout") ? 1 : 0;
+    if (!have_timeout) return false;
+    return queryCmd("timeout 0.3 gsettings get org.gnome.desktop.interface "
+                    "color-scheme 2>/dev/null",
+                    "dark");
+#endif
 }
 
 void themeTick(Uint32 now_ms)
 {
-    /* No cheap change signal outside Windows: themeSystemDark() samples once
-     * per process, so there is nothing to poll. */
-    (void)now_ms;
+    if (s_mode != ThemeMode::System) return;
+    if (s_last_poll != 0 && (Uint32)(now_ms - s_last_poll) < 2000) return;
+    s_last_poll = now_ms;
+    const bool dark = themeSystemDark();
+    if (dark == s_sys_dark && s_resolved) return;
+    s_sys_dark = dark;
+    s_resolved = true;
+    s_theme = dark ? darkPalette() : lightPalette();
 }
 
 #endif

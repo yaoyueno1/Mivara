@@ -38,7 +38,7 @@ Mivara/
 | 程序 | 职责 |
 |------|------|
 | `app` | 图形启动器：左侧导航（主页/设置）、接收/发送选择、主页内嵌连接历史、SSDP 搜索、机器列表（投屏/扩展）、手动 IP、运行时调参 |
-| `sender` | 采集画面（GDI/X11/CoreGraphics），协商模式，推流；扩展模式仅 Windows，经 vdd 模块管理虚拟显示器的激活与定位。Linux 复用 X11 连接，MIT-SHM（否则按行拷贝）取像素，并用 XFixes 合成光标 |
+| `sender` | 采集画面（GDI / X11 / Wayland 门户 / CoreGraphics），协商模式，推流。Windows 扩展经 vdd 模块管理 MttVDD。Linux 扩展经 vdd_linux 启用虚拟输出，只采集那一块矩形；X11 复用连接，MIT-SHM（否则按行拷贝）取像素并用 XFixes 合成光标，Wayland 走 xdg-desktop-portal + PipeWire。macOS 扩展在发现前拒绝 |
 | `receiver` | SSDP 广播，全屏渲染，承载计算卸载与端口检查两个附加服务 |
 
 ## 网络端口
@@ -54,7 +54,7 @@ Mivara/
 
 ## 工作原理
 
-一次完整会话依次经过：发现（或直连）→ 握手 →（仅 Windows 扩展模式）激活虚拟显示器 → 帧流传输 → 会话收尾拆除。Linux/macOS 没有虚拟显示器，`--mode extend` 在发现之前就失败，不会进入这条握手。以下按这个顺序展开。
+一次完整会话依次经过：发现（或直连）→ 选定模式 →（扩展）启用虚拟输出 → 打开采集 → 握手 → 帧流传输 → 会话收尾拆除。macOS 的 `--mode extend` 在发现之前失败（`extend_unsupported`）。Linux 在选定扩展之后、握手之前调用 `linuxVddStartup`；失败则 `vdd_unavailable`，不会把主屏以 mode=1 发出。Windows 仍在握手前由 `vddStartup` 启用 MttVDD。以下按这个顺序展开。
 
 ### 1 — 发现（SSDP）
 
@@ -72,7 +72,7 @@ Mivara/
 ```
 bin/sender 192.168.1.105        # 跳过发现，直接连接 8081
 bin/sender 192.168.1.105 8081   # 也可指定端口
-bin/sender 192.168.1.105 --mode extend    # 非交互：mirror / extend（GUI 使用；extend 仅 Windows）
+bin/sender 192.168.1.105 --mode extend    # 非交互：mirror / extend（GUI 使用；macOS 会拒绝，Linux 会先启用虚拟输出）
 ```
 
 更多网络细节（多播、子网与防火墙）见 [网络与防火墙](network.md)。
@@ -106,7 +106,7 @@ bin/sender 192.168.1.105 --mode extend    # 非交互：mirror / extend（GUI �
 
 ### 3 — 虚拟显示器生命周期（扩展模式）
 
-这一节只描述 Windows。Linux 与 macOS 上 `sender --mode extend` 在握手前退出（`STAT|event=error|msg=extend_unsupported`），GUI 的「扩展」为禁用按钮。不会在没有虚拟显示器时发送 mode=1。
+下面先写 Windows。macOS 上 `sender --mode extend` 在发现前退出（`STAT|event=error|msg=extend_unsupported`），GUI 的「扩展」为禁用按钮。Linux 的路径写在本节末尾。三端都不会在没有虚拟输出时发送 mode=1。
 
 ```
 选择扩展模式
@@ -144,15 +144,27 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
 
 推流套接字带 2 秒发送超时：对端断开或假死时发送很快失败，会话立即收尾拆除虚拟显示器，不会卡死。
 
+#### Linux 虚拟输出
+
+这不是内核驱动。`WAYLAND_DISPLAY` 已设置时先试 Sway（`swaymsg create_output`），再试 Hyprland（`hyprctl output create headless`），否则用 `xrandr`。xrandr 优先选用未连接且名为 `VIRTUAL*` 的接口；`MIVARA_VDD_OUTPUT` 可指定输出名，已连接的物理输出会被拒绝。`MIVARA_VDD_ALLOW_DISCONNECTED=1` 才允许启用其它未连接接口。模式行在进程内按 CVT 生成，输出放到主屏右侧，然后只采集这块矩形。
+
+Wayland 采集在握手前打开：xdg-desktop-portal 弹出共享对话框，PipeWire 提供画面，光标由合成器画进帧。门户失败时，X11 扩展回退到这块矩形的 X11 采集；Sway / Hyprland 的 headless 输出不回退，以免把主屏当成扩展发出，状态为 `capture_unavailable`。两者都打不开时同样报这个错误，不推黑帧。
+
+状态写在 `$XDG_RUNTIME_DIR/mivara-vdd`（否则 `/tmp/mivara-vdd-<uid>`）。正常退出、Ctrl+C 和 `atexit` 都会拆除本次创建的输出；GUI 在 SIGKILL 之后调用 `linuxVddForceDetach()`。GNOME Wayland 没有用户态虚拟屏，本仓库不加载内核模块；用户自行安装（例如 evdi）并让 xrandr 列出 `VIRTUAL*` 之后，xrandr 路径会用它。
+
 ### 4 — 帧流
 
 ```
-发送端   →  采集画面（扩展模式=虚拟屏，仅 Windows；镜像=主屏）
+发送端   →  采集画面（扩展模式=虚拟屏；镜像=主屏。
+           Linux Wayland 走门户，失败时 X11/XWayland 回退，
+           Sway/Hyprland 扩展除外）
         →  将鼠标光标绘制进帧（Windows：GetCursorInfo + DrawIconEx；
-           Linux：XFixes，Display 在会话内复用，像素走 MIT-SHM 或按行拷贝；
+           Linux X11：XFixes，Display 在会话内复用，像素走 MIT-SHM 或按行拷贝；
+           Linux Wayland：门户请求嵌入光标，由合成器画进画面；
            macOS 暂不合成光标）
         →  按协商编码处理：
-             H.264/H.265/AV1  → FFmpeg 编码（硬件优先，低延迟调优）→ 发送访问单元
+             H.264/H.265/AV1  → FFmpeg 编码（硬件优先，含 VAAPI 的 hwdevice；
+                                设备打不开则回退软件）→ 发送访问单元
              RLE              → 可选经计算卸载服务压缩（8082）
              原始             → 直接发送 RGB24
         →  发送 [uint32 帧长][帧数据]

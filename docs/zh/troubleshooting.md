@@ -15,7 +15,9 @@
 | "Virtual display driver not found" | MttVDD 驱动未安装 | 按[安装步骤](virtual-display.md)安装驱动 |
 | "Virtual display did not come up" | 驱动安装但激活失败 | `pnputil /enum-devices /class Monitor` 检查设备状态，重启后再试；详见[虚拟显示器驱动](virtual-display.md) |
 | 扩展模式黑屏 / 无画面 | 两端握手不一致（模式值 0=镜像 1=扩展） | 接收端与发送端使用同版本二进制 |
-| Linux/macOS 上「扩展」点了没开始，或 sender 打印 extend_unsupported | 扩展依赖 Windows 虚拟显示器，这两端故意拒绝 mode=1 | 改用「投屏」或 `--mode mirror`。Wayland 原生采集与 Linux/macOS 虚拟显示器仍在[路线图](roadmap.md) |
+| macOS 上「扩展」点了没开始，或 sender 打印 extend_unsupported | macOS 没有虚拟显示器，故意拒绝 mode=1 | 改用「投屏」或 `--mode mirror`。macOS 虚拟显示器仍在[路线图](roadmap.md) |
+| Linux 上扩展立刻结束，状态是 vdd_unavailable | 当前桌面没有可用的虚拟输出 | X11 需要断开的 `VIRTUAL*` 接口，或设置 `MIVARA_VDD_OUTPUT`；Sway / Hyprland 会自动创建 headless 输出。GNOME Wayland 需要用户自行安装内核虚拟显示器（例如 evdi）。程序不会改动已经连接的物理显示器。见[虚拟显示器驱动](virtual-display.md) |
+| Linux 上提示无法采集画面（capture_unavailable） | Wayland 门户和 X11 都不可用，或扩展用的是 Sway/Hyprland 输出但门户没有采到那一块屏 | 安装 `xdg-desktop-portal` 与 PipeWire，并在共享对话框里允许采集。纯 X11 会话确认 `DISPLAY` 可用。门户等待时间可用 `MIVARA_PORTAL_WAIT_MS` 调整 |
 | 断开后虚拟屏仍在「设置 → 屏幕」 | 旧版本只做 CCD 分离，或未以管理员运行 | 已修复：退出时禁用 Root\MttVDD 设备（需管理员权限运行 sender/app）。若日志出现 disable 失败，可在设备管理器手动禁用「Virtual Display Driver」。驱动说明见[虚拟显示器驱动](virtual-display.md) |
 | 「检查更新」失败（DNS 解析失败 / 请求超时 / 安全连接失败） | 检查只访问 `github.com`，直连不稳定时（企业网络或大陆网络常见）会失败，属预期降级 | 点设置页「打开下载页」用浏览器（走系统代理/VPN）手动下载安装；安装新版本前建议先在应用内「退出」，确保虚拟显示器正确卸载 |
 | 点「下载更新」提示「未找到校验文件」 | 该 Release 未附带 `SHA256SUMS.txt`（应用内安装要求有哈希锚点，缺失时不做应用内安装） | 用「打开下载页」手动下载安装即可 |

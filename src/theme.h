@@ -12,10 +12,10 @@
  * text, 3:1 for large text and UI edges) in BOTH modes; see the ratios recorded
  * next to each palette below.
  *
- * "Follow system" reads the OS light/dark preference. Only Windows offers a
- * cheap change signal (a registry DWORD), so that is the only platform polled
- * at runtime; macOS/Linux resolve once at startup and never block the UI if
- * detection fails (failure ⇒ light).
+ * "Follow system" reads the OS light/dark preference and themeTick() refreshes
+ * it about every 2 s. Windows reads a registry DWORD. Linux reads GTK
+ * settings.ini and KDE kdeglobals, and only then a gsettings query bounded by
+ * `timeout 0.3`. macOS reads `defaults`. Detection failure stays on light.
  */
 #ifndef MIVARA_THEME_H
 #define MIVARA_THEME_H
@@ -82,8 +82,8 @@ Theme &theme();
 ThemeMode themeMode();
 /** Switch mode; re-resolves the palette immediately. */
 void themeSetMode(ThemeMode mode);
-/** Re-resolve "follow system"; cheap, call once per frame. Rate-limits itself.
- *  Polls only on Windows — see the note above about the other platforms. */
+/** Re-resolve "follow system"; cheap, call once per frame. Rate-limits itself
+ *  to about every 2 s on every platform. */
 void themeTick(Uint32 now_ms);
 /** Raw OS preference (true = dark). Exposed for logging/diagnostics. */
 bool themeSystemDark();

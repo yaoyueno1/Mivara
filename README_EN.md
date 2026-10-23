@@ -53,11 +53,11 @@ Other platforms and packaging: [Building & Packaging](docs/en/building.md).
 | Platform | Version | Dependencies |
 |----------|---------|--------------|
 | Windows | Windows 10 1903+ / Windows 11 | Installer bundles the runtime DLLs; building from source needs MinGW-w64 (MSYS2), MSVC is not supported |
-| Linux | Ubuntu 18.04+ / Debian 10+ / Fedora 32+ / Arch | X11 (libX11/libXext/libXfixes), GCC 8+, SDL2, SDL2_ttf; `make install-deps` installs a CJK font |
+| Linux | Ubuntu 18.04+ / Debian 10+ / Fedora 32+ / Arch | X11 (libX11/libXext/libXfixes), GCC 8+, SDL2, SDL2_ttf; Wayland capture also needs libpipewire-0.3 and libdbus-1 (`make install-deps` installs them); `make install-deps` installs a CJK font |
 | macOS | Catalina 10.15+ | Clang 12+, SDL2, SDL2_ttf (`brew install sdl2 sdl2_ttf`) |
 
 - `sender` / `app` embed a `requireAdministrator` manifest and need one UAC confirmation at launch; `receiver` does not run elevated.
-- Extend mode relies on a Windows indirect display driver, installed once — see [Virtual Display Driver](docs/en/virtual-display.md). On Linux / macOS Extend is unavailable and `--mode extend` fails with an explicit error; mirror still works. Linux capture is X11 (including the cursor) and does not include native Wayland.
+- On Windows, extend mode relies on an indirect display driver, installed once — see [Virtual Display Driver](docs/en/virtual-display.md). On macOS Extend is unavailable and `--mode extend` fails with an explicit error. On Linux it tries an xrandr `VIRTUAL*` output, or a Sway / Hyprland headless output; if that does not come up it errors and does not send the primary screen as extend. Wayland capture uses xdg-desktop-portal and falls back to X11/XWayland. Mirror works on all three platforms.
 
 ## Documentation
 

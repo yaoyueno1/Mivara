@@ -22,6 +22,7 @@ The list below tracks shipped and planned features in order; `[x]` means shipped
 - [ ] TLS encryption
 - [ ] Virtual display resolution adapts to the receiver (post-handshake negotiation)
 - [ ] Adaptive frame rate
-- [ ] Wayland support
-- [ ] Virtual display solutions for macOS/Linux
+- [x] Wayland support (xdg-desktop-portal + PipeWire capture; falls back to X11/XWayland, and reports a clear error when neither can capture)
+- [ ] Virtual display solution for macOS
+- [x] Linux extend (xrandr VIRTUAL output, Sway headless, Hyprland headless. GNOME on Wayland still needs a kernel virtual display the user installs, such as evdi; this repo does not load a kernel module)
 - [ ] Screen stitching
