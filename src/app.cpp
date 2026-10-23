@@ -10,7 +10,9 @@
  *   HOME       – 接收 / 发送 cards + connection-history rows below
  *   RECEIVING  – "正在接收" + local IP / ports; spawns bin/receiver
  *   SEARCHING  – "搜索中" (SSDP discovery on a background thread)
- *   FOUND      – machine list, each row offers 投屏 (mirror) / 扩展 (extend)
+ *   FOUND      – machine list, each row offers 投屏 (mirror) / 扩展 (extend).
+ *                Off Windows the extend chip stays visible but disabled:
+ *                extend is the Windows virtual display, not a mirror alias.
  *   NOT_FOUND  – 继续搜索 / 手动输入ip
  *   MANUAL_IP  – type a receiver IP, then the same mode choice
  *   STREAMING  – session running (bin/sender …) + live STAT panel
@@ -423,6 +425,7 @@ struct Button {
     int         glyph   = GLYPH_NONE;
     bool        on      = false;      /* BTN_V_CHOICE: this cell is selected */
     bool        framed  = true;       /* BTN_V_CHOICE: draw the cell's own border */
+    bool        enabled = true;       /* false: painted dim, click explains why */
     TTF_Font   *font    = nullptr;    /* null = the variant's default size   */
 };
 
@@ -539,8 +542,15 @@ static TTF_Font *openFont(int size)
         "C:/Windows/Fonts/simsun.ttc",     /* SimSun                */
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", /* Arch */
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",    /* Debian/Ubuntu */
+        "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",    /* Fedora */
+        "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc", /* Arch */
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
+        "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
@@ -562,8 +572,12 @@ static TTF_Font *openFontBold(int size)
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simhei.ttf",     /* SimHei is already bold-ish */
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+        "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
         "/System/Library/Fonts/PingFang.ttc",
         nullptr
     };
@@ -1585,6 +1599,18 @@ static void drawButton(SDL_Renderer *ren, const Button &b)
 {
     if (b.variant == BTN_V_GHOST) return;      /* hit area only, caller paints */
 
+    /* Disabled chips (extend off Windows) stay in the layout so the row
+     * doesn't reshuffle, but they must not read as a live action. */
+    if (!b.enabled) {
+        fillRoundRect(ren, b.rect, THEME.radius - 3, THEME.surfaceAlt);
+        if (!b.label.empty()) {
+            TTF_Font *f = b.font ? b.font : g_fontBS;
+            drawTextV(ren, b.label, b.rect.x + b.rect.w / 2,
+                      b.rect.y + b.rect.h / 2, THEME.textDim, f, ALIGN_CENTER);
+        }
+        return;
+    }
+
     const bool hot   = (g_hot == b.id);
     const bool press = (g_press == b.id);
     const int  r     = THEME.radius;
@@ -1755,6 +1781,24 @@ static void addSegment(int x, int y, int w, int h, int id, bool on, int glyph)
 {
     addChoice(x, y, w, h, "", id, on, nullptr, glyph);
     g_buttons.back().framed = false;
+}
+
+/** Extend chip. Off Windows it is drawn disabled — clicking it explains
+ *  that virtual-display extend is Windows-only instead of launching sender
+ *  with --mode extend. */
+static bool extendAvailable()
+{
+#ifdef _WIN32
+    return true;
+#else
+    return false;
+#endif
+}
+
+static void addExtendChip(int x, int y, int w, int h, int id)
+{
+    addButton(x, y, w, h, "扩展", id, BTN_V_CHIP_ACC);
+    if (!extendAvailable()) g_buttons.back().enabled = false;
 }
 
 /** A nav-rail item; 'on' marks the active tab. */
@@ -2564,8 +2608,18 @@ static void startSearch()
 /* Take ip/name by value: history callers pass references into g_hist, and
  * this function reloads g_hist below — keeping those references would leave
  * ip/name dangling before the final status/last-used assignments. */
+static void noteExtendUnavailable()
+{
+    g_status_note = "扩展仅 Windows 可用（需要虚拟显示器）";
+    logPush("[gui] 扩展模式不可用：Linux/macOS 没有虚拟显示器，请使用投屏");
+}
+
 static void launchStream(std::string ip, int port, bool extend, std::string name)
 {
+    if (extend && !extendAvailable()) {
+        noteExtendUnavailable();
+        return;
+    }
     std::string path = sibling("sender.exe");
 #ifndef _WIN32
     path = sibling("sender");
@@ -2724,8 +2778,7 @@ static void buildButtons()
             SDL_Rect b3 = rcHistBtn(i, 2);
             addButton(b1.x, b1.y, b1.w, b1.h, "投屏", BTN_HIST_BASE + idx * 10 + 1,
                       BTN_V_CHIP_OK);
-            addButton(b2.x, b2.y, b2.w, b2.h, "扩展", BTN_HIST_BASE + idx * 10 + 2,
-                      BTN_V_CHIP_ACC);
+            addExtendChip(b2.x, b2.y, b2.w, b2.h, BTN_HIST_BASE + idx * 10 + 2);
             addButton(b3.x, b3.y, b3.w, b3.h, "删除", BTN_HIST_BASE + idx * 10 + 3,
                       BTN_V_LINK);
         }
@@ -2754,8 +2807,8 @@ static void buildButtons()
             const int y = FOUND_ROW_Y0 + (int)i * FOUND_ROW_PITCH;
             addButton(BODY_R - 220, y + 8, 100, 36, "投屏",
                       BTN_DEV_BASE + (int)i * 10 + 1, BTN_V_CHIP_OK);
-            addButton(BODY_R - 112, y + 8, 100, 36, "扩展",
-                      BTN_DEV_BASE + (int)i * 10 + 2, BTN_V_CHIP_ACC);
+            addExtendChip(BODY_R - 112, y + 8, 100, 36,
+                          BTN_DEV_BASE + (int)i * 10 + 2);
         }
         {
             const int y = foundActionsY((int)n);
@@ -3109,8 +3162,11 @@ static void renderScreen(int mousex, int mousey)
                     std::string nm = e.name.empty() ? e.ip : truncateUtf8(e.name, 10);
                     drawText(g_ren, fitText(nm, g_fontS, 440), row.x + 12, row.y + 5,
                              THEME.text, g_fontS);
+                    const char *modeTag = (e.mode == "extend")
+                        ? (extendAvailable() ? "扩展" : "扩展·仅Windows")
+                        : "投屏";
                     std::string sub = e.ip + ":" + std::to_string(e.port) + " · " +
-                                      (e.mode == "extend" ? "扩展" : "投屏") + " · " +
+                                      modeTag + " · " +
                                       relTime(e.last_used_unix) + " · ×" +
                                       std::to_string(e.use_count);
                     drawText(g_ren, fitText(sub, g_fontS, 440), row.x + 12, row.y + 23,
@@ -3172,8 +3228,13 @@ static void renderScreen(int mousex, int mousey)
         }
         drawText(g_ren, "发现 " + std::to_string(devs.size()) + " 台设备", BODY_X,
                  TITLE_Y, THEME.text, g_fontB);
-        drawTextV(g_ren, "选择投屏或扩展", BODY_R, TITLE_Y + 12, THEME.textDim,
-                  g_fontS, ALIGN_RIGHT);
+        if (!g_status_note.empty())
+            drawTextV(g_ren, g_status_note, BODY_R, TITLE_Y + 12, THEME.danger,
+                      g_fontS, ALIGN_RIGHT);
+        else
+            drawTextV(g_ren,
+                      extendAvailable() ? "选择投屏或扩展" : "扩展仅 Windows 可用",
+                      BODY_R, TITLE_Y + 12, THEME.textDim, g_fontS, ALIGN_RIGHT);
         for (size_t i = 0; i < devs.size() && i < 6; i++) {
             const int y = FOUND_ROW_Y0 + (int)i * FOUND_ROW_PITCH;
             const SDL_Rect row{BODY_X, y, BODY_W, FOUND_ROW_H};
@@ -3664,9 +3725,12 @@ static void onButton(int id)
                 std::lock_guard<std::mutex> lk(g_dev_mtx);
                 devs = g_devices;
             }
-            if (idx >= 0 && idx < (int)devs.size() && (kind == 1 || kind == 2))
-                launchStream(devs[idx].ip_address, devs[idx].tcp_port,
-                             kind == 2, devs[idx].name);
+            if (idx >= 0 && idx < (int)devs.size() && (kind == 1 || kind == 2)) {
+                if (kind == 2 && !extendAvailable()) noteExtendUnavailable();
+                else
+                    launchStream(devs[idx].ip_address, devs[idx].tcp_port,
+                                 kind == 2, devs[idx].name);
+            }
             break;
         }
         /* history rows: BTN_HIST_BASE + idx*10 + 0(row) / 1 / 2 / 3 */
@@ -3685,7 +3749,12 @@ static void onButton(int id)
                         std::max(0, (int)g_hist.size() - HIST_VISIBLE);
                     if (g_hist_scroll > maxScroll) g_hist_scroll = maxScroll;
                 } else if (kind == 1 || kind == 2) {
-                    launchStream(e.ip, e.port, kind == 2, e.name);
+                    if (kind == 2 && !extendAvailable()) noteExtendUnavailable();
+                    else launchStream(e.ip, e.port, kind == 2, e.name);
+                } else if (!extendAvailable() && e.mode == "extend") {
+                    /* row body would reconnect as extend — refuse, don't
+                     * silently retarget the saved mode to mirror */
+                    noteExtendUnavailable();
                 } else {
                     /* row body click: reconnect with the entry's last mode */
                     launchStream(e.ip, e.port, e.mode == "extend", e.name);

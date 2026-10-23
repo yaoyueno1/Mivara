@@ -71,7 +71,8 @@ ifeq ($(UNAME_S),Linux)
 
     CXXFLAGS += -D_REENTRANT
     NET_LIBS := -lpthread
-    SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lX11
+    # Xfixes: cursor image. Xext: MIT-SHM. X11: display connection.
+    SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lXfixes -lXext -lX11
     RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
     APP_LIBS      := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
     RES_ADMIN     :=
@@ -333,21 +334,32 @@ check:
     else \
         echo "    NOT FOUND  SDL2_ttf  <-- required for the GUI (app)"; \
     fi
+	@if [ "$(PLATFORM)" = "linux" ]; then \
+        echo "  X11 capture headers:"; \
+        for h in X11/Xlib.h X11/extensions/XShm.h X11/extensions/Xfixes.h; do \
+            if [ -f /usr/include/$$h ]; then echo "    OK  $$h"; \
+            else echo "    NOT FOUND  $$h  <-- Linux sender"; fi; \
+        done; \
+    fi
 	@echo "========================================="
 
 install-deps:
 	@echo "Installing dependencies..."
 	@if command -v apt-get >/dev/null 2>&1; then \
         sudo apt-get update && \
-        sudo apt-get install -y g++ make libx11-dev libsdl2-dev libsdl2-ttf-dev \
-            libavcodec-dev libavutil-dev libswscale-dev; \
+        sudo apt-get install -y g++ make libx11-dev libxext-dev libxfixes-dev \
+            libsdl2-dev libsdl2-ttf-dev \
+            libavcodec-dev libavutil-dev libswscale-dev \
+            fonts-wqy-microhei; \
 	elif command -v dnf >/dev/null 2>&1; then \
-        sudo dnf install -y gcc-c++ make libX11-devel SDL2-devel SDL2_ttf-devel \
+        sudo dnf install -y gcc-c++ make libX11-devel libXext-devel libXfixes-devel \
+            SDL2-devel SDL2_ttf-devel wqy-microhei-fonts \
             ffmpeg-free-devel || sudo dnf install -y gcc-c++ make libX11-devel \
-            SDL2-devel SDL2_ttf-devel ffmpeg-devel; \
+            libXext-devel libXfixes-devel SDL2-devel SDL2_ttf-devel \
+            wqy-microhei-fonts ffmpeg-devel; \
 	elif command -v yum >/dev/null 2>&1; then \
-        sudo yum install -y gcc-c++ make libX11-devel SDL2-devel SDL2_ttf-devel \
-            ffmpeg-devel; \
+        sudo yum install -y gcc-c++ make libX11-devel libXext-devel libXfixes-devel \
+            SDL2-devel SDL2_ttf-devel wqy-microhei-fonts ffmpeg-devel; \
 	elif command -v pacman >/dev/null 2>&1; then \
         if [ -n "$$MINGW_PACKAGE_PREFIX" ]; then \
             pacman -S --needed --noconfirm \
@@ -357,14 +369,16 @@ install-deps:
                 "$${MINGW_PACKAGE_PREFIX}-SDL2_ttf" \
                 "$${MINGW_PACKAGE_PREFIX}-ffmpeg"; \
         else \
-            sudo pacman -S --needed --noconfirm gcc make libx11 sdl2 sdl2_ttf ffmpeg; \
+            sudo pacman -S --needed --noconfirm gcc make libx11 libxext libxfixes \
+                sdl2 sdl2_ttf ffmpeg wqy-microhei; \
         fi; \
 	elif command -v brew >/dev/null 2>&1; then \
         brew install sdl2 sdl2_ttf ffmpeg; \
 	else \
         echo "Unsupported package manager.  Install manually:"; \
         echo "  g++ / clang++ (C++17)"; \
-        echo "  libX11-dev  (Linux screen capture)"; \
+        echo "  libX11-dev libXext-dev libXfixes-dev  (Linux screen capture + cursor)"; \
+        echo "  fonts-wqy-microhei / wqy-microhei-fonts / wqy-microhei  (GUI CJK)"; \
         echo "  libSDL2-dev"; \
         echo "  libSDL2-ttf-dev  (GUI launcher)"; \
         echo "  libavcodec-dev libavutil-dev libswscale-dev  (H.264/H.265/AV1)"; \
@@ -396,3 +410,4 @@ help:
 	@echo "SENDER CLI:"
 	@echo "  bin/sender [ip] [port] [--mode mirror|extend]"
 	@echo "    --mode skips all interactive prompts (used by the GUI)"
+	@echo "    --mode extend is Windows-only (virtual display); Linux/macOS exit"

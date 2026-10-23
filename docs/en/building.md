@@ -10,8 +10,8 @@ This page covers building Mivara from source on Linux, Windows and macOS, what e
 
 - Ubuntu 18.04+ / Debian 10+ / Fedora 32+ / Arch
 - GCC 8+ (C++17), make
-- libX11-dev, libsdl2-dev, libsdl2-ttf-dev, pthread
-- Any CJK font (`fonts-wqy-microhei` or Noto Sans CJK) — the GUI exits with an error if no font is found
+- libx11-dev, libxext-dev, libxfixes-dev, libsdl2-dev, libsdl2-ttf-dev, pthread (capture reuses the X11 connection, bulk-copies via MIT-SHM, and composites the cursor with XFixes)
+- A CJK font — the GUI exits with an error if none is found. `make install-deps` installs one: Debian/Ubuntu `fonts-wqy-microhei`, Fedora/RHEL `wqy-microhei-fonts`, Arch `wqy-microhei`. Noto Sans CJK also works (the probe checks the usual paths on those distros)
 
 **Windows**
 
@@ -42,8 +42,9 @@ make install-deps          # Linux/macOS/MSYS2 automatic install
 | Component | Purpose |
 |-----------|---------|
 | g++ / make | C++17 build |
-| libX11-dev | Linux screen capture |
-| SDL2 / SDL2_ttf | Receiver rendering + GUI (CJK fonts) |
+| libX11 / libXext / libXfixes | Linux screen capture (reused connection, MIT-SHM, XFixes cursor) |
+| fonts-wqy-microhei and equivalents | GUI CJK text (package names above; installed by `make install-deps`) |
+| SDL2 / SDL2_ttf | Receiver rendering + GUI |
 | **FFmpeg** (libavcodec/libavutil/libswscale) | H.264/H.265/AV1 encode/decode (MSYS2: `mingw-w64-x86_64-ffmpeg`) |
 
 ## Building

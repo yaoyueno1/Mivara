@@ -2,7 +2,7 @@
 
 > [文档索引](../README.md) · [返回 README](../../README.md) · [English](../en/virtual-display.md)
 
-扩展模式依赖 Windows 间接显示驱动（IddCx）提供一块真实的虚拟显示器。本页说明驱动来源、一次性安装步骤与分辨率配置；设备在每次会话中的启用、附加与清理流程，见[架构与协议](architecture.md)。
+扩展模式依赖 Windows 间接显示驱动（IddCx）提供一块真实的虚拟显示器。Linux 与 macOS 目前没有对应实现：这两端的「扩展」按钮是禁用的，`sender --mode extend` 会明确失败，不会把主屏画面以扩展模式发出。本页说明驱动来源、一次性安装步骤与分辨率配置；设备在每次会话中的启用、附加与清理流程，见[架构与协议](architecture.md)。
 
 ## 驱动来源
 

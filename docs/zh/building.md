@@ -10,8 +10,8 @@
 
 - Ubuntu 18.04+ / Debian 10+ / Fedora 32+ / Arch
 - GCC 8+（C++17）、make
-- libX11-dev、libsdl2-dev、libsdl2-ttf-dev、pthread
-- 任一系统中文字体（`fonts-wqy-microhei` 或 Noto Sans CJK）——GUI 缺字体会直接报错退出
+- libx11-dev、libxext-dev、libxfixes-dev、libsdl2-dev、libsdl2-ttf-dev、pthread（采集复用 X11 连接，MIT-SHM 批量拷贝，XFixes 合成光标）
+- 中文字体——GUI 找不到会直接报错退出。`make install-deps` 会安装：Debian/Ubuntu `fonts-wqy-microhei`，Fedora/RHEL `wqy-microhei-fonts`，Arch `wqy-microhei`。也可自行安装 Noto Sans CJK（程序同时查找这些发行版的常见路径）
 
 **Windows**
 
@@ -41,8 +41,9 @@ make install-deps          # Linux/macOS/MSYS2 自动安装
 | 组件 | 用途 |
 |------|------|
 | g++ / make | C++17 构建 |
-| libX11-dev | Linux 屏幕采集 |
-| SDL2 / SDL2_ttf | 接收端渲染 + GUI（中文字体） |
+| libX11 / libXext / libXfixes | Linux 屏幕采集（连接复用、MIT-SHM、XFixes 光标） |
+| fonts-wqy-microhei 等 | GUI 中文（包名见上方各发行版；`make install-deps` 会装） |
+| SDL2 / SDL2_ttf | 接收端渲染 + GUI |
 | **FFmpeg**（libavcodec/libavutil/libswscale） | H.264/H.265/AV1 编解码（MSYS2: `mingw-w64-x86_64-ffmpeg`） |
 
 ## 从源码构建

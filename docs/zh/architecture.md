@@ -38,7 +38,7 @@ Mivara/
 | 程序 | 职责 |
 |------|------|
 | `app` | 图形启动器：左侧导航（主页/设置）、接收/发送选择、主页内嵌连接历史、SSDP 搜索、机器列表（投屏/扩展）、手动 IP、运行时调参 |
-| `sender` | 采集画面（GDI/X11/CoreGraphics），协商模式，推流；扩展模式下经 vdd 模块管理虚拟显示器的激活与定位 |
+| `sender` | 采集画面（GDI/X11/CoreGraphics），协商模式，推流；扩展模式仅 Windows，经 vdd 模块管理虚拟显示器的激活与定位。Linux 复用 X11 连接，MIT-SHM（否则按行拷贝）取像素，并用 XFixes 合成光标 |
 | `receiver` | SSDP 广播，全屏渲染，承载计算卸载与端口检查两个附加服务 |
 
 ## 网络端口
@@ -54,7 +54,7 @@ Mivara/
 
 ## 工作原理
 
-一次完整会话依次经过：发现（或直连）→ 握手 → 扩展模式下激活虚拟显示器 → 帧流传输 → 会话收尾拆除。以下按这个顺序展开。
+一次完整会话依次经过：发现（或直连）→ 握手 →（仅 Windows 扩展模式）激活虚拟显示器 → 帧流传输 → 会话收尾拆除。Linux/macOS 没有虚拟显示器，`--mode extend` 在发现之前就失败，不会进入这条握手。以下按这个顺序展开。
 
 ### 1 — 发现（SSDP）
 
@@ -72,7 +72,7 @@ Mivara/
 ```
 bin/sender 192.168.1.105        # 跳过发现，直接连接 8081
 bin/sender 192.168.1.105 8081   # 也可指定端口
-bin/sender 192.168.1.105 --mode extend    # 非交互：直接指定 mirror / extend（GUI 使用）
+bin/sender 192.168.1.105 --mode extend    # 非交互：mirror / extend（GUI 使用；extend 仅 Windows）
 ```
 
 更多网络细节（多播、子网与防火墙）见 [网络与防火墙](network.md)。
@@ -105,6 +105,8 @@ bin/sender 192.168.1.105 --mode extend    # 非交互：直接指定 mirror / ex
 两端必须为同一版本。旧版（16 字节握手）会被识别为 legacy peer 并给出明确报错，不会再黑屏。
 
 ### 3 — 虚拟显示器生命周期（扩展模式）
+
+这一节只描述 Windows。Linux 与 macOS 上 `sender --mode extend` 在握手前退出（`STAT|event=error|msg=extend_unsupported`），GUI 的「扩展」为禁用按钮。不会在没有虚拟显示器时发送 mode=1。
 
 ```
 选择扩展模式
@@ -145,8 +147,10 @@ Windows CCD API（`QueryDisplayConfig` / `SetDisplayConfig`）、
 ### 4 — 帧流
 
 ```
-发送端   →  采集画面（扩展模式=虚拟屏；镜像=主屏）
-        →  将鼠标光标绘制进帧（GetCursorInfo + DrawIconEx）
+发送端   →  采集画面（扩展模式=虚拟屏，仅 Windows；镜像=主屏）
+        →  将鼠标光标绘制进帧（Windows：GetCursorInfo + DrawIconEx；
+           Linux：XFixes，Display 在会话内复用，像素走 MIT-SHM 或按行拷贝；
+           macOS 暂不合成光标）
         →  按协商编码处理：
              H.264/H.265/AV1  → FFmpeg 编码（硬件优先，低延迟调优）→ 发送访问单元
              RLE              → 可选经计算卸载服务压缩（8082）

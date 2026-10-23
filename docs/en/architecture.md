@@ -38,7 +38,7 @@ Mivara/
 | Program | Responsibility |
 |---------|----------------|
 | `app` | GUI launcher: left nav (Home/Settings), receive/send choice, connection history on Home, SSDP search, device list (cast/extend), manual IP, live reconfigure |
-| `sender` | Captures the screen (GDI/X11/CoreGraphics), negotiates mode, streams; manages virtual-display activation and positioning in extend mode via the vdd module |
+| `sender` | Captures the screen (GDI/X11/CoreGraphics), negotiates mode, streams; extend mode is Windows-only and manages virtual-display activation and positioning via the vdd module. Linux reuses one X11 connection, copies pixels with MIT-SHM (or a row copy) and composites the cursor with XFixes |
 | `receiver` | SSDP broadcast, fullscreen rendering, hosts the two sidecar services |
 
 ## Network Ports
@@ -54,7 +54,7 @@ All four ports must be allowed on the receiver; see [Network & Firewall](network
 
 ## How It Works
 
-A full session runs in order: discovery (or direct connect) → handshake → virtual-display activation in extend mode → frame streaming → teardown. The sections below follow that order.
+A full session runs in order: discovery (or direct connect) → handshake → virtual-display activation in extend mode (Windows only) → frame streaming → teardown. Linux and macOS have no virtual display; `--mode extend` fails before discovery and never reaches this handshake. The sections below follow that order.
 
 ### 1 — Discovery (SSDP)
 
@@ -72,7 +72,7 @@ If network policy blocks even broadcast, use direct connect:
 ```
 bin/sender 192.168.1.105        # skip discovery, connect straight to 8081
 bin/sender 192.168.1.105 8081   # or specify the port
-bin/sender 192.168.1.105 --mode extend    # non-interactive: set mirror / extend (used by the GUI)
+bin/sender 192.168.1.105 --mode extend    # non-interactive: mirror / extend (GUI; extend is Windows-only)
 ```
 
 For more on multicast, subnets and firewalls, see [Network & Firewall](network.md).
@@ -105,6 +105,8 @@ Receiver → Sender   HsResponseV2 (36 bytes)
 Both ends must run the same version. A legacy peer (old 16-byte handshake) is detected and reported explicitly — no silent black screen.
 
 ### 3 — Virtual Display Lifecycle (Extend Mode)
+
+This section is Windows-only. On Linux and macOS `sender --mode extend` exits before the handshake (`STAT|event=error|msg=extend_unsupported`), and the GUI Extend chip is disabled. mode=1 is never sent without a virtual display.
 
 ```
 Extend mode selected
@@ -151,8 +153,10 @@ display is detached immediately instead of hanging.
 ### 4 — Frame Streaming
 
 ```
-Sender    →  capture (extend mode = virtual screen; mirror = primary screen)
-          →  draw the mouse cursor into the frame (GetCursorInfo + DrawIconEx)
+Sender    →  capture (extend mode = virtual screen, Windows only; mirror = primary screen)
+          →  draw the mouse cursor into the frame (Windows: GetCursorInfo + DrawIconEx;
+             Linux: XFixes, one Display for the session, pixels via MIT-SHM or a row copy;
+             macOS does not composite a cursor yet)
           →  encode per the negotiated codec:
                H.264/H.265/AV1  → FFmpeg encode (hardware-first, low-latency tuned) → send AU
                RLE              → optionally compress via the compute offload service (8082)

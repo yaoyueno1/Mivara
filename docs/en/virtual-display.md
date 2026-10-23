@@ -2,7 +2,7 @@
 
 > [Docs index](../README.md) · [Back to README](../../README_EN.md) · [中文](../zh/virtual-display.md)
 
-Extend mode relies on a Windows indirect display driver (IddCx) to provide a real virtual monitor. This page covers the driver's provenance, the one-time installation steps and resolution configuration; for how the device is enabled, attached and cleaned up during each session, see [Architecture & Protocol](architecture.md).
+Extend mode relies on a Windows indirect display driver (IddCx) to provide a real virtual monitor. Linux and macOS have no equivalent today: the Extend button is disabled there, and `sender --mode extend` fails with an explicit error instead of streaming the primary screen as extend. This page covers the driver's provenance, the one-time installation steps and resolution configuration; for how the device is enabled, attached and cleaned up during each session, see [Architecture & Protocol](architecture.md).
 
 ## Driver Provenance
 

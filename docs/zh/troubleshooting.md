@@ -15,6 +15,7 @@
 | "Virtual display driver not found" | MttVDD 驱动未安装 | 按[安装步骤](virtual-display.md)安装驱动 |
 | "Virtual display did not come up" | 驱动安装但激活失败 | `pnputil /enum-devices /class Monitor` 检查设备状态，重启后再试；详见[虚拟显示器驱动](virtual-display.md) |
 | 扩展模式黑屏 / 无画面 | 两端握手不一致（模式值 0=镜像 1=扩展） | 接收端与发送端使用同版本二进制 |
+| Linux/macOS 上「扩展」点了没开始，或 sender 打印 extend_unsupported | 扩展依赖 Windows 虚拟显示器，这两端故意拒绝 mode=1 | 改用「投屏」或 `--mode mirror`。Wayland 原生采集与 Linux/macOS 虚拟显示器仍在[路线图](roadmap.md) |
 | 断开后虚拟屏仍在「设置 → 屏幕」 | 旧版本只做 CCD 分离，或未以管理员运行 | 已修复：退出时禁用 Root\MttVDD 设备（需管理员权限运行 sender/app）。若日志出现 disable 失败，可在设备管理器手动禁用「Virtual Display Driver」。驱动说明见[虚拟显示器驱动](virtual-display.md) |
 | 「检查更新」失败（DNS 解析失败 / 请求超时 / 安全连接失败） | 检查只访问 `github.com`，直连不稳定时（企业网络或大陆网络常见）会失败，属预期降级 | 点设置页「打开下载页」用浏览器（走系统代理/VPN）手动下载安装；安装新版本前建议先在应用内「退出」，确保虚拟显示器正确卸载 |
 | 点「下载更新」提示「未找到校验文件」 | 该 Release 未附带 `SHA256SUMS.txt`（应用内安装要求有哈希锚点，缺失时不做应用内安装） | 用「打开下载页」手动下载安装即可 |
