@@ -38,7 +38,7 @@ Mivara/
 | Program | Responsibility |
 |---------|----------------|
 | `app` | GUI launcher: left nav (Home/Settings), receive/send choice, connection history on Home, SSDP search, device list (cast/extend), manual IP, live reconfigure |
-| `sender` | Captures the screen (GDI/X11/CoreGraphics), negotiates mode, streams; manages virtual-display activation and positioning in extend mode via the vdd module |
+| `sender` | Captures the screen (GDI / X11 / Wayland portal / CoreGraphics), negotiates mode, streams. Windows extend manages MttVDD through the vdd module. Linux extend enables a virtual output through vdd_linux and captures only that rectangle; X11 reuses one connection, copies pixels with MIT-SHM (or a row copy) and composites the cursor with XFixes, and Wayland uses xdg-desktop-portal + PipeWire. macOS extend is refused before discovery |
 | `receiver` | SSDP broadcast, fullscreen rendering, hosts the two sidecar services |
 
 ## Network Ports
@@ -54,7 +54,7 @@ All four ports must be allowed on the receiver; see [Network & Firewall](network
 
 ## How It Works
 
-A full session runs in order: discovery (or direct connect) → handshake → virtual-display activation in extend mode → frame streaming → teardown. The sections below follow that order.
+A full session runs in order: discovery (or direct connect) → mode selection → virtual-output enablement in extend mode → capture open → handshake → frame streaming → teardown. On macOS `--mode extend` fails before discovery (`extend_unsupported`). On Linux `linuxVddStartup` runs after extend is selected and before the handshake; failure is `vdd_unavailable` and the primary screen is never sent as mode=1. Windows still enables MttVDD with `vddStartup` before the handshake. The sections below follow that order.
 
 ### 1 — Discovery (SSDP)
 
@@ -72,7 +72,7 @@ If network policy blocks even broadcast, use direct connect:
 ```
 bin/sender 192.168.1.105        # skip discovery, connect straight to 8081
 bin/sender 192.168.1.105 8081   # or specify the port
-bin/sender 192.168.1.105 --mode extend    # non-interactive: set mirror / extend (used by the GUI)
+bin/sender 192.168.1.105 --mode extend    # non-interactive: mirror / extend (GUI; macOS refuses, Linux enables a virtual output first)
 ```
 
 For more on multicast, subnets and firewalls, see [Network & Firewall](network.md).
@@ -105,6 +105,8 @@ Receiver → Sender   HsResponseV2 (36 bytes)
 Both ends must run the same version. A legacy peer (old 16-byte handshake) is detected and reported explicitly — no silent black screen.
 
 ### 3 — Virtual Display Lifecycle (Extend Mode)
+
+The steps below are the Windows path. On macOS `sender --mode extend` exits before discovery (`STAT|event=error|msg=extend_unsupported`), and the GUI Extend chip is disabled. The Linux path is at the end of this section. None of the three platforms sends mode=1 without a virtual output.
 
 ```
 Extend mode selected
@@ -148,13 +150,27 @@ The streaming socket has a 2 s send timeout: when the peer disconnects or
 goes silent the send fails quickly, the session ends, and the virtual
 display is detached immediately instead of hanging.
 
+#### Linux virtual output
+
+This is not a kernel driver. When `WAYLAND_DISPLAY` is set the sender tries Sway (`swaymsg create_output`) first, then Hyprland (`hyprctl output create headless`), otherwise `xrandr`. xrandr prefers a disconnected connector named `VIRTUAL*`. `MIVARA_VDD_OUTPUT` names a connector; an already-connected physical output is refused. `MIVARA_VDD_ALLOW_DISCONNECTED=1` is what allows some other disconnected connector. The modeline is generated in-process (CVT), the output is placed to the right of the primary, and capture is limited to that rectangle.
+
+Wayland capture opens before the handshake: xdg-desktop-portal shows the share dialog, PipeWire delivers frames, and the compositor draws the cursor. If the portal fails, an X11 extend falls back to X11 capture of that rectangle. A Sway / Hyprland headless output does not fall back, so the primary screen is not sent as extend, and the status is `capture_unavailable`. The same error is reported when neither capture path opens, and no black frames are streamed.
+
+State is written to `$XDG_RUNTIME_DIR/mivara-vdd` (or `/tmp/mivara-vdd-<uid>`). Normal exit, Ctrl+C and `atexit` remove the output this session created; after SIGKILL the GUI calls `linuxVddForceDetach()`. GNOME on Wayland has no userspace virtual monitor, and this repo does not load a kernel module. After the user installs one (evdi, for example) and xrandr lists a `VIRTUAL*` connector, the xrandr path uses it.
+
 ### 4 — Frame Streaming
 
 ```
-Sender    →  capture (extend mode = virtual screen; mirror = primary screen)
-          →  draw the mouse cursor into the frame (GetCursorInfo + DrawIconEx)
+Sender    →  capture (extend mode = virtual screen; mirror = primary screen.
+             On Linux, Wayland uses the portal and falls back to X11/XWayland,
+             except for a Sway/Hyprland extend)
+          →  draw the mouse cursor into the frame (Windows: GetCursorInfo + DrawIconEx;
+             Linux X11: XFixes, one Display for the session, pixels via MIT-SHM or a row copy;
+             Linux Wayland: the portal asks for an embedded cursor and the compositor draws it;
+             macOS does not composite a cursor yet)
           →  encode per the negotiated codec:
-               H.264/H.265/AV1  → FFmpeg encode (hardware-first, low-latency tuned) → send AU
+               H.264/H.265/AV1  → FFmpeg encode (hardware-first, including a VAAPI hwdevice;
+                                  a device that will not open falls back to software) → send AU
                RLE              → optionally compress via the compute offload service (8082)
                raw              → send RGB24 as-is
           →  send [uint32 frame length][frame data]

@@ -10,7 +10,10 @@
  *   HOME       – 接收 / 发送 cards + connection-history rows below
  *   RECEIVING  – "正在接收" + local IP / ports; spawns bin/receiver
  *   SEARCHING  – "搜索中" (SSDP discovery on a background thread)
- *   FOUND      – machine list, each row offers 投屏 (mirror) / 扩展 (extend)
+ *   FOUND      – machine list, each row offers 投屏 (mirror) / 扩展 (extend).
+ *                On macOS the extend chip stays visible but disabled.
+ *                Linux launches sender --mode extend, which enables a virtual
+ *                output or fails with a visible status note.
  *   NOT_FOUND  – 继续搜索 / 手动输入ip
  *   MANUAL_IP  – type a receiver IP, then the same mode choice
  *   STREAMING  – session running (bin/sender …) + live STAT panel
@@ -50,6 +53,9 @@
 #include "theme.h"
 #include "update.h"
 #include "vdd.h"
+#ifdef __linux__
+#include "vdd_linux.h"
+#endif
 #include "version.h"
 
 #ifdef _WIN32
@@ -423,6 +429,7 @@ struct Button {
     int         glyph   = GLYPH_NONE;
     bool        on      = false;      /* BTN_V_CHOICE: this cell is selected */
     bool        framed  = true;       /* BTN_V_CHOICE: draw the cell's own border */
+    bool        enabled = true;       /* false: painted dim, click explains why */
     TTF_Font   *font    = nullptr;    /* null = the variant's default size   */
 };
 
@@ -501,6 +508,7 @@ static std::deque<std::string> g_log_lines;
 static std::mutex              g_log_mtx;
 static LiveStats               g_stats;
 static std::mutex              g_stats_mtx;
+static std::string             g_last_child_error; /* last STAT event=error msg */
 
 static int g_hot = BTN_NONE;
 static int g_press = BTN_NONE;
@@ -539,8 +547,15 @@ static TTF_Font *openFont(int size)
         "C:/Windows/Fonts/simsun.ttc",     /* SimSun                */
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", /* Arch */
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",    /* Debian/Ubuntu */
+        "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",    /* Fedora */
+        "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc", /* Arch */
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
+        "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
@@ -562,8 +577,12 @@ static TTF_Font *openFontBold(int size)
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simhei.ttf",     /* SimHei is already bold-ish */
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+        "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
         "/System/Library/Fonts/PingFang.ttc",
         nullptr
     };
@@ -1585,6 +1604,18 @@ static void drawButton(SDL_Renderer *ren, const Button &b)
 {
     if (b.variant == BTN_V_GHOST) return;      /* hit area only, caller paints */
 
+    /* Disabled chips (extend off Windows) stay in the layout so the row
+     * doesn't reshuffle, but they must not read as a live action. */
+    if (!b.enabled) {
+        fillRoundRect(ren, b.rect, THEME.radius - 3, THEME.surfaceAlt);
+        if (!b.label.empty()) {
+            TTF_Font *f = b.font ? b.font : g_fontBS;
+            drawTextV(ren, b.label, b.rect.x + b.rect.w / 2,
+                      b.rect.y + b.rect.h / 2, THEME.textDim, f, ALIGN_CENTER);
+        }
+        return;
+    }
+
     const bool hot   = (g_hot == b.id);
     const bool press = (g_press == b.id);
     const int  r     = THEME.radius;
@@ -1755,6 +1786,25 @@ static void addSegment(int x, int y, int w, int h, int id, bool on, int glyph)
 {
     addChoice(x, y, w, h, "", id, on, nullptr, glyph);
     g_buttons.back().framed = false;
+}
+
+/** Extend chip. On macOS it is drawn disabled — clicking it explains that
+ *  there is no virtual display, instead of launching sender --mode extend.
+ *  Linux and Windows both launch extend; Linux fails visibly if no virtual
+ *  output can be created. */
+static bool extendAvailable()
+{
+#if defined(_WIN32) || defined(__linux__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+static void addExtendChip(int x, int y, int w, int h, int id)
+{
+    addButton(x, y, w, h, "扩展", id, BTN_V_CHIP_ACC);
+    if (!extendAvailable()) g_buttons.back().enabled = false;
 }
 
 /** A nav-rail item; 'on' marks the active tab. */
@@ -2004,14 +2054,27 @@ static void parseStatLine(const std::string &line)
             else if (k == "src") s.src = v;
             else if (k == "dst") s.dst = v;
             else if (k == "quality") s.quality = v;
-            else if (k == "event") s.event = v;
+            else             if (k == "event") s.event = v;
             else if (k == "msg") s.msg = v;
         }
         if (bar == std::string::npos) break;
         pos = bar + 1;
     }
     std::lock_guard<std::mutex> lk(g_stats_mtx);
+    if (s.event == "error" && !s.msg.empty())
+        g_last_child_error = s.msg;
     g_stats = s;
+}
+
+static std::string senderFailNote(const std::string &msg)
+{
+    if (msg == "extend_unsupported") return "扩展在此系统不可用";
+    if (msg == "vdd_unavailable" || msg == "vdd_startup_failed" || msg == "vdd_lost")
+        return "虚拟显示器未能启用";
+    if (msg == "capture_unavailable") return "无法采集画面";
+    if (msg == "encoder_open_failed") return "编码器打开失败";
+    if (msg.empty()) return "会话已结束";
+    return "会话已结束（" + msg + "）";
 }
 
 static void handleChildLine(const std::string &line)
@@ -2416,6 +2479,16 @@ static void stopChild(ChildProc &child, bool extend = false)
     waitpid(child.pid, nullptr, 0);
     child.active = false;
     stopReader(child);
+#ifdef __linux__
+    /* SIGKILL skips the sender's atexit, so the virtual output would stay. */
+    if (extend) {
+        std::cout << "强制停止：正在移除虚拟显示器...\n";
+        if (linuxVddForceDetach())
+            std::cout << "虚拟显示器已移除\n";
+        else
+            std::cout << "虚拟显示器移除失败（可能本就未激活）\n";
+    }
+#endif
 #endif
 }
 
@@ -2510,8 +2583,54 @@ static bool applyAutoStart(int enable)
     }
     return runHiddenW(sysExePath(L"schtasks.exe") + L" /delete /tn \"Mivara\" /f");
 #else
-    (void)enable;
-    return true; /* no-op outside Windows */
+    const char *xdg = std::getenv("XDG_CONFIG_HOME");
+    std::string base;
+    if (xdg && xdg[0]) base = xdg;
+    else {
+        const char *home = std::getenv("HOME");
+        if (!home || !home[0]) return false;
+        base = std::string(home) + "/.config";
+    }
+    const std::string dir = base + "/autostart";
+    const std::string path = dir + "/mivara.desktop";
+    if (!enable) {
+        if (unlink(path.c_str()) != 0 && errno != ENOENT) return false;
+        return true;
+    }
+    char exe[PATH_MAX] = {};
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return false;
+    exe[n] = 0;
+    std::string cur;
+    for (char c : dir) {
+        cur.push_back(c);
+        if (c == '/' && cur.size() > 1) {
+            if (mkdir(cur.c_str(), 0755) != 0 && errno != EEXIST) return false;
+        }
+    }
+    if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) return false;
+    std::string exec = exe;
+    if (exec.find(' ') != std::string::npos)
+        exec = "\"" + exec + "\"";
+    const std::string body =
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Mivara\n"
+        "Comment=LAN screen mirroring\n"
+        "Exec=" + exec + "\n"
+        "Terminal=false\n"
+        "X-GNOME-Autostart-enabled=true\n"
+        "Categories=Network;Utility;\n";
+    const std::string tmp = path + ".tmp";
+    FILE *f = std::fopen(tmp.c_str(), "w");
+    if (!f) return false;
+    const size_t wrote = std::fwrite(body.data(), 1, body.size(), f);
+    std::fclose(f);
+    if (wrote != body.size() || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
 #endif
 }
 
@@ -2564,8 +2683,18 @@ static void startSearch()
 /* Take ip/name by value: history callers pass references into g_hist, and
  * this function reloads g_hist below — keeping those references would leave
  * ip/name dangling before the final status/last-used assignments. */
+static void noteExtendUnavailable()
+{
+    g_status_note = "扩展在此系统不可用";
+    logPush("[gui] 扩展模式不可用：macOS 没有虚拟显示器，请使用投屏");
+}
+
 static void launchStream(std::string ip, int port, bool extend, std::string name)
 {
+    if (extend && !extendAvailable()) {
+        noteExtendUnavailable();
+        return;
+    }
     std::string path = sibling("sender.exe");
 #ifndef _WIN32
     path = sibling("sender");
@@ -2591,6 +2720,10 @@ static void launchStream(std::string ip, int port, bool extend, std::string name
     {
         std::lock_guard<std::mutex> lk(g_stats_mtx);
         g_stats = LiveStats{};
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_stats_mtx);
+        g_last_child_error.clear();
     }
     logPush("[gui] launch sender " + ip + ":" + std::to_string(port) +
             " mode=" + (extend ? "extend" : "mirror") +
@@ -2724,8 +2857,7 @@ static void buildButtons()
             SDL_Rect b3 = rcHistBtn(i, 2);
             addButton(b1.x, b1.y, b1.w, b1.h, "投屏", BTN_HIST_BASE + idx * 10 + 1,
                       BTN_V_CHIP_OK);
-            addButton(b2.x, b2.y, b2.w, b2.h, "扩展", BTN_HIST_BASE + idx * 10 + 2,
-                      BTN_V_CHIP_ACC);
+            addExtendChip(b2.x, b2.y, b2.w, b2.h, BTN_HIST_BASE + idx * 10 + 2);
             addButton(b3.x, b3.y, b3.w, b3.h, "删除", BTN_HIST_BASE + idx * 10 + 3,
                       BTN_V_LINK);
         }
@@ -2754,8 +2886,8 @@ static void buildButtons()
             const int y = FOUND_ROW_Y0 + (int)i * FOUND_ROW_PITCH;
             addButton(BODY_R - 220, y + 8, 100, 36, "投屏",
                       BTN_DEV_BASE + (int)i * 10 + 1, BTN_V_CHIP_OK);
-            addButton(BODY_R - 112, y + 8, 100, 36, "扩展",
-                      BTN_DEV_BASE + (int)i * 10 + 2, BTN_V_CHIP_ACC);
+            addExtendChip(BODY_R - 112, y + 8, 100, 36,
+                          BTN_DEV_BASE + (int)i * 10 + 2);
         }
         {
             const int y = foundActionsY((int)n);
@@ -3109,8 +3241,11 @@ static void renderScreen(int mousex, int mousey)
                     std::string nm = e.name.empty() ? e.ip : truncateUtf8(e.name, 10);
                     drawText(g_ren, fitText(nm, g_fontS, 440), row.x + 12, row.y + 5,
                              THEME.text, g_fontS);
+                    const char *modeTag = (e.mode == "extend")
+                        ? (extendAvailable() ? "扩展" : "扩展·不可用")
+                        : "投屏";
                     std::string sub = e.ip + ":" + std::to_string(e.port) + " · " +
-                                      (e.mode == "extend" ? "扩展" : "投屏") + " · " +
+                                      modeTag + " · " +
                                       relTime(e.last_used_unix) + " · ×" +
                                       std::to_string(e.use_count);
                     drawText(g_ren, fitText(sub, g_fontS, 440), row.x + 12, row.y + 23,
@@ -3172,8 +3307,13 @@ static void renderScreen(int mousex, int mousey)
         }
         drawText(g_ren, "发现 " + std::to_string(devs.size()) + " 台设备", BODY_X,
                  TITLE_Y, THEME.text, g_fontB);
-        drawTextV(g_ren, "选择投屏或扩展", BODY_R, TITLE_Y + 12, THEME.textDim,
-                  g_fontS, ALIGN_RIGHT);
+        if (!g_status_note.empty())
+            drawTextV(g_ren, g_status_note, BODY_R, TITLE_Y + 12, THEME.danger,
+                      g_fontS, ALIGN_RIGHT);
+        else
+            drawTextV(g_ren,
+                      extendAvailable() ? "选择投屏或扩展" : "扩展在此系统不可用",
+                      BODY_R, TITLE_Y + 12, THEME.textDim, g_fontS, ALIGN_RIGHT);
         for (size_t i = 0; i < devs.size() && i < 6; i++) {
             const int y = FOUND_ROW_Y0 + (int)i * FOUND_ROW_PITCH;
             const SDL_Rect row{BODY_X, y, BODY_W, FOUND_ROW_H};
@@ -3602,7 +3742,11 @@ static void onButton(int id)
          * current; drop the task when it was just switched off. */
         if (want != had || want == 1) {
             if (!applyAutoStart(want))
+#ifdef _WIN32
                 g_status_note = "计划任务写入失败（需管理员）";
+#else
+                g_status_note = "开机自启动写入失败（检查 ~/.config/autostart 权限）";
+#endif
             else
                 g_status_note.clear();
         }
@@ -3664,9 +3808,12 @@ static void onButton(int id)
                 std::lock_guard<std::mutex> lk(g_dev_mtx);
                 devs = g_devices;
             }
-            if (idx >= 0 && idx < (int)devs.size() && (kind == 1 || kind == 2))
-                launchStream(devs[idx].ip_address, devs[idx].tcp_port,
-                             kind == 2, devs[idx].name);
+            if (idx >= 0 && idx < (int)devs.size() && (kind == 1 || kind == 2)) {
+                if (kind == 2 && !extendAvailable()) noteExtendUnavailable();
+                else
+                    launchStream(devs[idx].ip_address, devs[idx].tcp_port,
+                                 kind == 2, devs[idx].name);
+            }
             break;
         }
         /* history rows: BTN_HIST_BASE + idx*10 + 0(row) / 1 / 2 / 3 */
@@ -3685,7 +3832,12 @@ static void onButton(int id)
                         std::max(0, (int)g_hist.size() - HIST_VISIBLE);
                     if (g_hist_scroll > maxScroll) g_hist_scroll = maxScroll;
                 } else if (kind == 1 || kind == 2) {
-                    launchStream(e.ip, e.port, kind == 2, e.name);
+                    if (kind == 2 && !extendAvailable()) noteExtendUnavailable();
+                    else launchStream(e.ip, e.port, kind == 2, e.name);
+                } else if (!extendAvailable() && e.mode == "extend") {
+                    /* row body would reconnect as extend — refuse, don't
+                     * silently retarget the saved mode to mirror */
+                    noteExtendUnavailable();
                 } else {
                     /* row body click: reconnect with the entry's last mode */
                     launchStream(e.ip, e.port, e.mode == "extend", e.name);
@@ -3947,9 +4099,17 @@ int main(int argc, char *argv[])
 
         /* child exit tracking */
         if (g_sender.active && childExited(g_sender, "sender")) {
+#ifdef __linux__
+            if (g_child_extend) linuxVddForceDetach();
+#endif
+            std::string fail;
+            {
+                std::lock_guard<std::mutex> lk(g_stats_mtx);
+                fail = g_last_child_error;
+            }
             g_child_extend = false;
             if (g_screen == SCR_STREAMING) {
-                g_status_note = "会话已结束";
+                g_status_note = senderFailNote(fail);
                 setScreen(SCR_HOME);
             }
         }

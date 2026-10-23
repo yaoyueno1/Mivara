@@ -7,9 +7,10 @@
  *   SVT-AV1    preset=8 + fast-decode=1
  *   NVENC      tune=ull / delay=0 ·  QSV async_depth=1 ·  AMF ultralowlatency
  *
- * Hardware encoders are fed system-memory NV12 (swscale RGB24→NV12) –
- * no hw_frames_ctx. If a hardware encoder fails to open, the next
- * candidate is tried (software last).
+ * NVENC / QSV / AMF are fed system-memory NV12 (swscale RGB24→NV12).
+ * VAAPI needs AV_PIX_FMT_VAAPI plus a hw_device_ctx and hw_frames_ctx;
+ * frames are uploaded with av_hwframe_transfer_data. If a hardware
+ * encoder fails to open, the next candidate is tried (software last).
  */
 #include "codec.h"
 
@@ -21,6 +22,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/error.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 }
 
@@ -139,6 +141,8 @@ struct Encoder::Priv {
     AVFrame        *frame = nullptr;
     AVPacket       *pkt   = nullptr;
     SwsContext     *sws   = nullptr;
+    AVFrame        *sw_frame = nullptr; /* NV12 staging buffer for VAAPI upload */
+    bool            vaapi = false;
     int src_w = 0, src_h = 0;
     int dst_w = 0, dst_h = 0;
     int64_t pts = 0;
@@ -167,8 +171,10 @@ void Encoder::close()
 {
     if (p_->sws)   { sws_freeContext(p_->sws); p_->sws = nullptr; }
     if (p_->pkt)   { av_packet_free(&p_->pkt); }
+    if (p_->sw_frame) { av_frame_free(&p_->sw_frame); }
     if (p_->frame) { av_frame_free(&p_->frame); }
     if (p_->ctx)   { avcodec_free_context(&p_->ctx); }
+    p_->vaapi = false;
     p_->pts = 0;
 }
 
@@ -197,6 +203,7 @@ static void applyEncoderOptions(const AVCodec *codec, AVCodecContext *ctx,
     const bool is_nvenc = std::strstr(n, "nvenc") != nullptr;
     const bool is_qsv   = std::strstr(n, "_qsv") != nullptr;
     const bool is_amf   = std::strstr(n, "_amf") != nullptr;
+    const bool is_vaapi = std::strstr(n, "vaapi") != nullptr;
 
     if (is_x264) {
         av_opt_set(priv, "preset", "veryfast", 0);
@@ -261,10 +268,49 @@ static void applyEncoderOptions(const AVCodec *codec, AVCodecContext *ctx,
             av_opt_set(priv, "qp_i", num, 0);
             av_opt_set(priv, "qp_p", num, 0);
         }
+    } else if (is_vaapi) {
+        std::snprintf(num, sizeof(num), "%d", quality);
+        if (cfg.bitrate_kbps > 0)
+            av_opt_set(priv, "rc_mode", "CBR", 0);
+        else {
+            av_opt_set(priv, "rc_mode", "CQP", 0);
+            av_opt_set(priv, "qp", num, 0);
+        }
     }
-    if (hw) {
-        /* nothing extra – system-memory NV12 frames */
+    (void)hw;
+}
+
+static void noteVaapi(const std::string &name, const std::string &why)
+{
+    std::fprintf(stderr, "VAAPI %s: %s (trying the next encoder)\n",
+                 name.c_str(), why.c_str());
+}
+
+/* VAAPI encodes AV_PIX_FMT_VAAPI surfaces. dev/frames are extra refs the
+ * caller drops after open; the codec context keeps its own. */
+static bool setupVaapi(AVCodecContext *ctx, int w, int h,
+                       AVBufferRef *&dev, AVBufferRef *&frames, std::string &why)
+{
+    int ret = av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_VAAPI,
+                                    nullptr, nullptr, 0);
+    if (ret < 0) { why = avErr(ret); return false; }
+    frames = av_hwframe_ctx_alloc(dev);
+    if (!frames) { why = "hwframe alloc failed"; return false; }
+    AVHWFramesContext *fc = reinterpret_cast<AVHWFramesContext *>(frames->data);
+    fc->format = AV_PIX_FMT_VAAPI;
+    fc->sw_format = AV_PIX_FMT_NV12;
+    fc->width = w;
+    fc->height = h;
+    fc->initial_pool_size = 8;
+    ret = av_hwframe_ctx_init(frames);
+    if (ret < 0) { why = avErr(ret); return false; }
+    ctx->hw_device_ctx = av_buffer_ref(dev);
+    ctx->hw_frames_ctx = av_buffer_ref(frames);
+    if (!ctx->hw_device_ctx || !ctx->hw_frames_ctx) {
+        why = "hw buffer ref failed";
+        return false;
     }
+    return true;
 }
 
 std::string Encoder::open(const EncoderConfig &cfg)
@@ -305,10 +351,26 @@ std::string Encoder::open(const EncoderConfig &cfg)
         ctx->height = cfg.height;
         ctx->time_base  = AVRational{1, cfg.fps};
         ctx->framerate  = AVRational{cfg.fps, 1};
-        ctx->pix_fmt    = nameIsHw(cname.c_str())
-                              ? AV_PIX_FMT_NV12
-                              : (cfg.chroma_444 ? AV_PIX_FMT_YUV444P
-                                                : AV_PIX_FMT_YUV420P);
+        const bool is_vaapi = std::strstr(cname.c_str(), "vaapi") != nullptr;
+        AVBufferRef *hw_dev = nullptr;
+        AVBufferRef *hw_frames = nullptr;
+        ctx->pix_fmt    = is_vaapi
+                              ? AV_PIX_FMT_VAAPI
+                              : (nameIsHw(cname.c_str())
+                                     ? AV_PIX_FMT_NV12
+                                     : (cfg.chroma_444 ? AV_PIX_FMT_YUV444P
+                                                       : AV_PIX_FMT_YUV420P));
+        if (is_vaapi) {
+            std::string why;
+            if (!setupVaapi(ctx, cfg.width, cfg.height, hw_dev, hw_frames, why)) {
+                errs += "[" + cname + ": " + why + "] ";
+                noteVaapi(cname, why);
+                av_buffer_unref(&hw_frames);
+                av_buffer_unref(&hw_dev);
+                avcodec_free_context(&ctx);
+                continue;
+            }
+        }
         /* Low latency */
         ctx->max_b_frames = 0;
         ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
@@ -329,46 +391,81 @@ std::string Encoder::open(const EncoderConfig &cfg)
         int ret = avcodec_open2(ctx, codec, nullptr);
         if (ret < 0) {
             errs += "[" + cname + ": " + avErr(ret) + "] ";
+            if (is_vaapi) noteVaapi(cname, avErr(ret));
+            av_buffer_unref(&hw_frames);
+            av_buffer_unref(&hw_dev);
             avcodec_free_context(&ctx);
             continue;
         }
 
-        /* swscale RGB24 → encoder pixel format (also handles --scale) */
+        /* swscale RGB24 → software pixel format. VAAPI uploads that NV12
+         * frame onto a surface; every other encoder receives it directly. */
+        const enum AVPixelFormat sw_fmt = is_vaapi ? AV_PIX_FMT_NV12 : ctx->pix_fmt;
         SwsContext *sws = sws_getContext(
             p_->src_w, p_->src_h, AV_PIX_FMT_RGB24,
-            cfg.width, cfg.height, ctx->pix_fmt,
+            cfg.width, cfg.height, sw_fmt,
             SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (!sws) {
             errs += "[" + cname + ": swscale failed] ";
+            av_buffer_unref(&hw_frames);
+            av_buffer_unref(&hw_dev);
             avcodec_free_context(&ctx);
             continue;
         }
 
         AVFrame *frame = av_frame_alloc();
+        AVFrame *sw = nullptr;
         AVPacket *pkt  = av_packet_alloc();
         if (!frame || !pkt) {
             errs += "[" + cname + ": frame/packet alloc failed] ";
             if (frame) av_frame_free(&frame);
             if (pkt) av_packet_free(&pkt);
             sws_freeContext(sws);
+            av_buffer_unref(&hw_frames);
+            av_buffer_unref(&hw_dev);
             avcodec_free_context(&ctx);
             continue;
         }
-        frame->format = ctx->pix_fmt;
-        frame->width  = cfg.width;
-        frame->height = cfg.height;
-        ret = av_frame_get_buffer(frame, 0);
+        if (is_vaapi) {
+            frame->format = AV_PIX_FMT_VAAPI;
+            frame->width  = cfg.width;
+            frame->height = cfg.height;
+            ret = av_hwframe_get_buffer(ctx->hw_frames_ctx, frame, 0);
+            sw = av_frame_alloc();
+            if (sw) {
+                sw->format = AV_PIX_FMT_NV12;
+                sw->width  = cfg.width;
+                sw->height = cfg.height;
+                if (ret >= 0) ret = av_frame_get_buffer(sw, 32);
+            } else if (ret >= 0) {
+                ret = AVERROR(ENOMEM);
+            }
+        } else {
+            frame->format = ctx->pix_fmt;
+            frame->width  = cfg.width;
+            frame->height = cfg.height;
+            ret = av_frame_get_buffer(frame, 0);
+        }
         if (ret < 0) {
             errs += "[" + cname + ": frame buffer: " + avErr(ret) + "] ";
+            if (is_vaapi) noteVaapi(cname, avErr(ret));
+            av_frame_free(&sw);
             av_frame_free(&frame);
             av_packet_free(&pkt);
             sws_freeContext(sws);
+            av_buffer_unref(&hw_frames);
+            av_buffer_unref(&hw_dev);
             avcodec_free_context(&ctx);
             continue;
         }
 
+        /* Context holds its own hw refs; drop the extras. */
+        av_buffer_unref(&hw_frames);
+        av_buffer_unref(&hw_dev);
         p_->ctx = ctx;
         p_->frame = frame;
+        p_->sw_frame = sw;
+        p_->vaapi = is_vaapi;
         p_->pkt = pkt;
         p_->sws = sws;
         p_->name = codec->name;
@@ -385,15 +482,22 @@ std::string Encoder::encode(const uint8_t *rgb24, std::vector<uint8_t> &out)
     out.clear();
     if (!p_->ctx || !rgb24) return "encoder: not open";
 
-    /* One sws pass: RGB24 (src size) → encoder pix_fmt (coded size). */
+    /* One sws pass: RGB24 (src size) → software pix_fmt (coded size).
+     * VAAPI then uploads that NV12 frame onto the hardware surface. */
+    AVFrame *dst = p_->vaapi ? p_->sw_frame : p_->frame;
+    if (!dst) return "encoder: not open";
     const uint8_t *slices[1] = {rgb24};
     int strides[1] = {p_->src_w * 3};
-    if (av_frame_make_writable(p_->frame) < 0)
+    if (av_frame_make_writable(dst) < 0)
         return "encoder: frame not writable";
 
     int ret = sws_scale(p_->sws, slices, strides, 0, p_->src_h,
-                        p_->frame->data, p_->frame->linesize);
+                        dst->data, dst->linesize);
     if (ret <= 0) return "encoder: swscale failed";
+    if (p_->vaapi) {
+        ret = av_hwframe_transfer_data(p_->frame, p_->sw_frame, 0);
+        if (ret < 0) return "encoder: vaapi upload failed: " + avErr(ret);
+    }
 
     p_->frame->pts = p_->pts++;
     if (p_->force_idr) {

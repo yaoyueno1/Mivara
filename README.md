@@ -53,11 +53,11 @@ make                 # 构建 bin/app、bin/sender、bin/receiver
 | 平台 | 版本 | 依赖 |
 |------|------|------|
 | Windows | Windows 10 1903+ / Windows 11 | 安装包已含运行时 DLL；从源码构建需 MinGW-w64（MSYS2），不支持 MSVC |
-| Linux | Ubuntu 18.04+ / Debian 10+ / Fedora 32+ / Arch | X11、GCC 8+、libX11、SDL2、SDL2_ttf、任一系统中文字体 |
+| Linux | Ubuntu 18.04+ / Debian 10+ / Fedora 32+ / Arch | X11（libX11/libXext/libXfixes）、GCC 8+、SDL2、SDL2_ttf；Wayland 采集另需 libpipewire-0.3 与 libdbus-1（`make install-deps` 会装）；中文字体由 `make install-deps` 安装 |
 | macOS | Catalina 10.15+ | Clang 12+、SDL2、SDL2_ttf（`brew install sdl2 sdl2_ttf`） |
 
 - `sender` / `app` 内嵌 `requireAdministrator` 清单，启动时需确认一次 UAC；`receiver` 不需要管理员权限。
-- 扩展模式依赖 Windows 间接显示驱动，只需安装一次，见[虚拟显示器驱动](docs/zh/virtual-display.md)。
+- Windows 上的扩展模式依赖间接显示驱动，只需安装一次，见[虚拟显示器驱动](docs/zh/virtual-display.md)。macOS 上「扩展」不可用，`--mode extend` 会直接报错。Linux 会尝试 xrandr 的 `VIRTUAL*` 输出，或 Sway / Hyprland 的 headless 输出；起不来就报错，不会把主屏当成扩展发出。Wayland 采集走 xdg-desktop-portal，失败时回退 X11/XWayland。镜像投屏在三端都可用。
 
 ## 文档
 

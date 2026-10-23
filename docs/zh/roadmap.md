@@ -22,6 +22,7 @@
 - [ ] TLS 加密
 - [ ] 虚拟显示器分辨率自适应接收端（握手后协商）
 - [ ] 自适应帧率
-- [ ] Wayland 支持
-- [ ] macOS/Linux 虚拟显示器方案
+- [x] Wayland 支持（xdg-desktop-portal + PipeWire 采集；失败回退 X11/XWayland，两者都不可用则明确报错）
+- [ ] macOS 虚拟显示器方案
+- [x] Linux 扩展屏（xrandr 的 VIRTUAL 输出、Sway headless、Hyprland headless。GNOME Wayland 仍需用户自行安装内核虚拟显示器，例如 evdi；本仓库不加载内核模块）
 - [ ] 屏幕拼接

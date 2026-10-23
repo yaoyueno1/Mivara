@@ -2,7 +2,7 @@
 
 > [Docs index](../README.md) · [Back to README](../../README_EN.md) · [中文](../zh/building.md)
 
-This page covers building Mivara from source on Linux, Windows and macOS, what each build target does, and how to package the Windows installer. Installing the virtual display driver required by extend mode is covered in [Virtual Display Driver](virtual-display.md).
+This page covers building Mivara from source on Linux, Windows and macOS, what each build target does, and how to package the Windows installer and the Linux tarball. The virtual display used by extend mode is covered in [Virtual Display Driver](virtual-display.md).
 
 ## Requirements
 
@@ -10,8 +10,10 @@ This page covers building Mivara from source on Linux, Windows and macOS, what e
 
 - Ubuntu 18.04+ / Debian 10+ / Fedora 32+ / Arch
 - GCC 8+ (C++17), make
-- libX11-dev, libsdl2-dev, libsdl2-ttf-dev, pthread
-- Any CJK font (`fonts-wqy-microhei` or Noto Sans CJK) — the GUI exits with an error if no font is found
+- libx11-dev, libxext-dev, libxfixes-dev, libsdl2-dev, libsdl2-ttf-dev, pthread (capture reuses the X11 connection, bulk-copies via MIT-SHM, and composites the cursor with XFixes)
+- libpipewire-0.3-dev, libdbus-1-dev (Wayland portal capture; installed by `make install-deps`. If they are missing at compile time, the sender falls back to X11 on Wayland)
+- At runtime: xdg-desktop-portal and PipeWire (Wayland capture), xrandr (X11 extend), swaymsg or hyprctl (extend on those compositors)
+- A CJK font — the GUI exits with an error if none is found. `make install-deps` installs one: Debian/Ubuntu `fonts-wqy-microhei`, Fedora/RHEL `wqy-microhei-fonts`, Arch `wqy-microhei`. Noto Sans CJK also works (the probe checks the usual paths on those distros)
 
 **Windows**
 
@@ -42,8 +44,10 @@ make install-deps          # Linux/macOS/MSYS2 automatic install
 | Component | Purpose |
 |-----------|---------|
 | g++ / make | C++17 build |
-| libX11-dev | Linux screen capture |
-| SDL2 / SDL2_ttf | Receiver rendering + GUI (CJK fonts) |
+| libX11 / libXext / libXfixes | Linux screen capture (reused connection, MIT-SHM, XFixes cursor) |
+| libpipewire-0.3 / libdbus-1 | Wayland portal capture (optional at compile time; without them the sender falls back to X11) |
+| fonts-wqy-microhei and equivalents | GUI CJK text (package names above; installed by `make install-deps`) |
+| SDL2 / SDL2_ttf | Receiver rendering + GUI |
 | **FFmpeg** (libavcodec/libavutil/libswscale) | H.264/H.265/AV1 encode/decode (MSYS2: `mingw-w64-x86_64-ffmpeg`) |
 
 ## Building
@@ -94,3 +98,9 @@ Build the installer with Inno Setup:
 A release must also carry the fixed-name copy `dist/Mivara-Setup.exe` (the in-app "Download update" and the README download badge both use that fixed URL) **and** `SHA256SUMS.txt` (the checksum anchor the in-app install verifies; without it only the browser download is offered). CI produces all three; for a local build copy it by hand: `copy dist\Mivara-Setup-<version>.exe dist\Mivara-Setup.exe`.
 
 The installer bundles `bin/` (exes + DLLs), `scripts/`, the `vdd/` virtual display driver (the oversized vendor GUI is excluded), and the documentation (`README.md`, `README_EN.md`, `LICENSE`, `CODE_SIGNING_POLICY.md`, `docs/`) so the relative links inside the installed READMEs resolve offline; it also creates Start-menu/desktop shortcuts. The "Launch Mivara" checkbox on the finish page starts the elevated GUI directly (the installer launches it with its elevated token — no second UAC prompt).
+
+## Linux packaging
+
+`scripts/package-linux.sh` builds the three programs with the redistributable `OPT_FLAGS="-O3 -march=x86-64 -flto"` and packs them as `dist/Mivara-<version>-linux-x86_64.tar.gz`. The `.desktop` file inside the archive keeps a relative `Exec`; after you move the folder, point it at the absolute path of `bin/app`. The GUI auto-start toggle writes a separate `~/.config/autostart/mivara.desktop` using the absolute path of the running program.
+
+When `appimagetool` is already on `PATH`, the script also tries an AppImage that still depends on the distro's shared libraries. Without that tool the tarball is the package, and the script does not download it.

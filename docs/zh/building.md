@@ -2,7 +2,7 @@
 
 > [文档索引](../README.md) · [返回 README](../../README.md) · [English](../en/building.md)
 
-本页说明如何在 Linux、Windows 与 macOS 上从源码构建 Mivara、各构建目标的用途，以及在 Windows 上打包安装程序。扩展模式所需的虚拟显示器驱动安装见[虚拟显示器驱动](virtual-display.md)。
+本页说明如何在 Linux、Windows 与 macOS 上从源码构建 Mivara、各构建目标的用途，以及 Windows 安装包和 Linux tar 包。扩展模式所需的虚拟显示器见[虚拟显示器驱动](virtual-display.md)。
 
 ## 环境要求
 
@@ -10,8 +10,10 @@
 
 - Ubuntu 18.04+ / Debian 10+ / Fedora 32+ / Arch
 - GCC 8+（C++17）、make
-- libX11-dev、libsdl2-dev、libsdl2-ttf-dev、pthread
-- 任一系统中文字体（`fonts-wqy-microhei` 或 Noto Sans CJK）——GUI 缺字体会直接报错退出
+- libx11-dev、libxext-dev、libxfixes-dev、libsdl2-dev、libsdl2-ttf-dev、pthread（采集复用 X11 连接，MIT-SHM 批量拷贝，XFixes 合成光标）
+- libpipewire-0.3-dev、libdbus-1-dev（Wayland 门户采集；`make install-deps` 会装。编译时缺失则发送端在 Wayland 上回退 X11）
+- 运行时：xdg-desktop-portal 与 PipeWire（Wayland 采屏）、xrandr（X11 扩展）、swaymsg 或 hyprctl（对应合成器上的扩展）
+- 中文字体——GUI 找不到会直接报错退出。`make install-deps` 会安装：Debian/Ubuntu `fonts-wqy-microhei`，Fedora/RHEL `wqy-microhei-fonts`，Arch `wqy-microhei`。也可自行安装 Noto Sans CJK（程序同时查找这些发行版的常见路径）
 
 **Windows**
 
@@ -41,8 +43,10 @@ make install-deps          # Linux/macOS/MSYS2 自动安装
 | 组件 | 用途 |
 |------|------|
 | g++ / make | C++17 构建 |
-| libX11-dev | Linux 屏幕采集 |
-| SDL2 / SDL2_ttf | 接收端渲染 + GUI（中文字体） |
+| libX11 / libXext / libXfixes | Linux 屏幕采集（连接复用、MIT-SHM、XFixes 光标） |
+| libpipewire-0.3 / libdbus-1 | Wayland 门户采集（编译时可选；缺失则发送端回退 X11） |
+| fonts-wqy-microhei 等 | GUI 中文（包名见上方各发行版；`make install-deps` 会装） |
+| SDL2 / SDL2_ttf | 接收端渲染 + GUI |
 | **FFmpeg**（libavcodec/libavutil/libswscale） | H.264/H.265/AV1 编解码（MSYS2: `mingw-w64-x86_64-ffmpeg`） |
 
 ## 从源码构建
@@ -93,3 +97,9 @@ make run          # 构建并启动图形启动器（另有 run-sender / run-rec
 发布时需**同时**上传固定名副本 `dist\Mivara-Setup.exe`（应用内「下载更新」与 README 的下载徽章都用这个固定名地址），以及 `SHA256SUMS.txt`（应用内安装的校验依据，缺失时只提供浏览器下载）。CI 打包会自动生成这三个文件；本地打包可手动复制：`copy dist\Mivara-Setup-<版本>.exe dist\Mivara-Setup.exe`。
 
 安装包内容：`bin/`（exe + DLL）、`scripts/`、`vdd/` 虚拟显示器驱动（不含体积超限的厂商 GUI），以及离线文档（`README.md`、`README_EN.md`、`LICENSE`、`CODE_SIGNING_POLICY.md`、`docs/`），安装后 README 里的相对链接仍可打开；安装后在开始菜单/桌面创建快捷方式。完成页的「启动 Mivara」勾选项直接拉起管理员权限的 GUI（安装器以提权令牌启动，无二次 UAC 弹窗）。
+
+## Linux 打包
+
+`scripts/package-linux.sh` 用可再分发的 `OPT_FLAGS="-O3 -march=x86-64 -flto"` 编译三个程序，打成 `dist/Mivara-<版本>-linux-x86_64.tar.gz`。压缩包里的 `.desktop` 把 `Exec` 留成相对路径，挪动目录后要改成 `bin/app` 的绝对路径。图形界面里的「开机自启动」会按当时的绝对路径另写一份 `~/.config/autostart/mivara.desktop`。
+
+PATH 里已经有 `appimagetool` 时，脚本会再试打一个仍依赖系统动态库的 AppImage。没有该工具时只给 tar 包，脚本不会去下载它。

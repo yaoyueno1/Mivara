@@ -27,9 +27,15 @@
  *
  * Platform notes
  * --------------
- * Windows : GDI capture; Winsock2.
- * Linux   : X11 capture; POSIX sockets. Wayland: set WAYLAND_DISPLAY="".
- * macOS   : CoreGraphics capture; POSIX sockets.
+ * Windows : GDI capture; Winsock2. Extend (mode 1) attaches MttVDD.
+ * Linux   : Wayland via xdg-desktop-portal + PipeWire when
+ *           WAYLAND_DISPLAY is set, otherwise X11 (Display reused,
+ *           MIT-SHM or row copy, XFixes cursor). Portal failure falls
+ *           back to X11/XWayland; if neither can capture, the sender
+ *           exits with capture_unavailable and does not stream black
+ *           frames. Extend enables an xrandr VIRTUAL output, or a Sway /
+ *           Hyprland headless output, and captures only that rectangle.
+ * macOS   : CoreGraphics capture; POSIX sockets. --mode extend refused.
  *           Link: -framework CoreGraphics -framework CoreFoundation
  *
  * Build deps: X11 (Linux), pthreads  (no SDL – console program)
@@ -52,6 +58,10 @@
 #include "gpu_accelerate.h"
 #include "ports.h"
 #include "vdd.h"
+#ifdef __linux__
+#include "vdd_linux.h"
+#include "wl_capture.h"
+#endif
 #include "proto.h"
 #include "codec.h"
 #include "version.h"
@@ -88,6 +98,10 @@
 #  include <errno.h>
 #  include <X11/Xlib.h>
 #  include <X11/Xutil.h>
+#  include <X11/extensions/XShm.h>
+#  include <X11/extensions/Xfixes.h>
+#  include <sys/ipc.h>
+#  include <sys/shm.h>
 #endif
 
 /* ── Display mode (values go over the wire – keep in sync with receiver) ── */
@@ -156,6 +170,12 @@ static std::string       g_recv_ip;    /* receiver address (RLE 8082 lifecycle) 
 static std::string g_cap_device;
 static POINT       g_cap_origin = {0, 0};   /* monitor origin in virtual desktop */
 #endif
+#ifdef __linux__
+static int         g_cap_x = 0, g_cap_y = 0; /* region origin on the X root */
+static bool        g_wl_active = false;
+static bool        g_capture_ok = true;
+static std::string g_vdd_backend;
+#endif
 
 static std::atomic<bool> g_running{true};
 
@@ -200,8 +220,12 @@ static void getScreenDimensions(int &w, int &h)
         std::cout << "Display: " << w << "x" << h << " (X11)\n";
     } else {
         w = 1920; h = 1080;
+        const char *wl = std::getenv("WAYLAND_DISPLAY");
         std::cerr << COL_YELLOW
-                  << "X11 open failed; defaulting to 1920x1080\n"
+                  << "X11 open failed"
+                  << ((wl && wl[0]) ? " (Wayland session; portal capture will be tried)"
+                                    : "")
+                  << "; defaulting to 1920x1080\n"
                   << COL_RESET;
     }
 #endif
@@ -429,27 +453,338 @@ static std::vector<uint8_t> captureScreen()
     return px;
 }
 
-#else   /* Linux / X11 */
+#else   /* Linux
+         * Wayland (portal + PipeWire) is preferred when WAYLAND_DISPLAY is
+         * set. Otherwise one X11 Display is kept for the session: pixels
+         * come from MIT-SHM or XGetImage (never XGetPixel), and the pointer
+         * is composited from XFixes. Extend mode captures g_cap_x/g_cap_y
+         * rather than the whole root. */
+
+static Display          *g_x11 = nullptr;
+static XShmSegmentInfo   g_x11_shm;
+static XImage           *g_x11_shm_image = nullptr;
+static int               g_x11_shm_w = 0, g_x11_shm_h = 0;
+static bool              g_x11_shm_ok = false;
+static bool              g_x11_shm_tried = false;
+static bool              g_x11_fixes = false;
+static bool              g_x11_logged = false;
+static bool              g_x11_cursor_logged = false;
+static int               g_x11_trap = 0;
+
+static int x11ErrorTrap(Display *, XErrorEvent *ev)
+{
+    g_x11_trap = ev ? (int)ev->error_code : 1;
+    return 0;
+}
+
+static void x11DestroyShm()
+{
+    if (!g_x11 || !g_x11_shm_image) return;
+    if (g_x11_shm_ok) {
+        XShmDetach(g_x11, &g_x11_shm);
+        XSync(g_x11, False);
+    }
+    if (g_x11_shm.shmaddr && g_x11_shm.shmaddr != (char *)-1)
+        shmdt(g_x11_shm.shmaddr);
+    g_x11_shm_image->data = nullptr;   /* shm, not an XFree buffer */
+    XDestroyImage(g_x11_shm_image);
+    g_x11_shm_image = nullptr;
+    g_x11_shm_ok = false;
+    g_x11_shm_w = g_x11_shm_h = 0;
+}
+
+static void x11CaptureShutdown()
+{
+    if (!g_x11) return;
+    x11DestroyShm();
+    XCloseDisplay(g_x11);
+    g_x11 = nullptr;
+    g_x11_shm_tried = false;
+    g_x11_fixes = false;
+}
+
+/* Attach a shared-memory image. Remote X (no MIT-SHM) fails the request
+ * asynchronously — the error trap turns that into a clean fallback. */
+static bool x11TryShm(int w, int h)
+{
+    if (!XShmQueryExtension(g_x11)) return false;
+    std::memset(&g_x11_shm, 0, sizeof(g_x11_shm));
+    const int screen = DefaultScreen(g_x11);
+    XImage *img = XShmCreateImage(g_x11, DefaultVisual(g_x11, screen),
+                                  (unsigned)DefaultDepth(g_x11, screen),
+                                  ZPixmap, nullptr, &g_x11_shm,
+                                  (unsigned)w, (unsigned)h);
+    if (!img) return false;
+    const size_t bytes = (size_t)img->bytes_per_line * (size_t)img->height;
+    g_x11_shm.shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0600);
+    if (g_x11_shm.shmid < 0) {
+        img->data = nullptr;
+        XDestroyImage(img);
+        return false;
+    }
+    g_x11_shm.shmaddr = (char *)shmat(g_x11_shm.shmid, nullptr, 0);
+    if (g_x11_shm.shmaddr == (char *)-1) {
+        shmctl(g_x11_shm.shmid, IPC_RMID, nullptr);
+        img->data = nullptr;
+        XDestroyImage(img);
+        return false;
+    }
+    img->data = g_x11_shm.shmaddr;
+    g_x11_shm.readOnly = False;
+
+    g_x11_trap = 0;
+    XErrorHandler prev = XSetErrorHandler(x11ErrorTrap);
+    const Bool attached = XShmAttach(g_x11, &g_x11_shm);
+    XSync(g_x11, False);
+    XSetErrorHandler(prev);
+    if (!attached || g_x11_trap) {
+        shmdt(g_x11_shm.shmaddr);
+        shmctl(g_x11_shm.shmid, IPC_RMID, nullptr);
+        img->data = nullptr;
+        XDestroyImage(img);
+        g_x11_shm.shmaddr = nullptr;
+        return false;
+    }
+    /* Drop the segment when the last mapping goes away, including a crash. */
+    shmctl(g_x11_shm.shmid, IPC_RMID, nullptr);
+    g_x11_shm_image = img;
+    g_x11_shm_w = w;
+    g_x11_shm_h = h;
+    return true;
+}
+
+static bool x11Ensure(int w, int h)
+{
+    if (!g_x11) {
+        g_x11 = XOpenDisplay(nullptr);
+        if (!g_x11) return false;
+        std::atexit(x11CaptureShutdown);
+        int ev = 0, err = 0, major = 0, minor = 0;
+        if (XFixesQueryExtension(g_x11, &ev, &err) &&
+            XFixesQueryVersion(g_x11, &major, &minor) && major >= 2)
+            g_x11_fixes = true;
+    }
+    if (g_x11_shm_image && (g_x11_shm_w != w || g_x11_shm_h != h)) {
+        x11DestroyShm();
+        g_x11_shm_tried = false;
+    }
+    if (!g_x11_shm_tried) {
+        g_x11_shm_tried = true;
+        g_x11_shm_ok = x11TryShm(w, h);
+    }
+    return true;
+}
+
+static int x11MaskShift(unsigned long mask)
+{
+    int s = 0;
+    if (mask == 0) return 0;
+    while ((mask & 1ul) == 0) { mask >>= 1; ++s; }
+    return s;
+}
+
+static uint32_t x11ReadPixel(const XImage *xi, const uint8_t *p)
+{
+    const int nbytes = xi->bits_per_pixel / 8;
+    uint32_t v = 0;
+    if (nbytes <= 0) return 0;
+    const int n = nbytes < 4 ? nbytes : 4;
+    if (xi->byte_order == MSBFirst) {
+        for (int i = 0; i < n; i++) v = (v << 8) | p[i];
+    } else {
+        for (int i = n - 1; i >= 0; i--) v = (v << 8) | p[i];
+    }
+    return v;
+}
+
+/* Row copy. 32-bit little-endian TrueColor (the common desktop visual) is
+ * a tight BGRX/RGBX loop; everything else goes through the channel masks. */
+static void x11CopyImage(const XImage *xi, uint8_t *dst, int w, int h)
+{
+    const int cw = xi->width  < w ? xi->width  : w;
+    const int ch = xi->height < h ? xi->height : h;
+    const int bpl = xi->bytes_per_line;
+    const int bpp = xi->bits_per_pixel;
+    const bool le = (xi->byte_order == LSBFirst);
+    const unsigned long rm = xi->red_mask, gm = xi->green_mask, bm = xi->blue_mask;
+
+    if (bpp == 32 && le && rm == 0x00ff0000ul && gm == 0x0000ff00ul &&
+        bm == 0x000000fful) {
+        for (int y = 0; y < ch; y++) {
+            const uint8_t *src = (const uint8_t *)xi->data + (size_t)y * bpl;
+            uint8_t *out = dst + (size_t)y * w * 3;
+            for (int x = 0; x < cw; x++) {
+                out[0] = src[2];
+                out[1] = src[1];
+                out[2] = src[0];
+                src += 4;
+                out += 3;
+            }
+        }
+        return;
+    }
+    if (bpp == 32 && le && rm == 0x000000fful && gm == 0x0000ff00ul &&
+        bm == 0x00ff0000ul) {
+        for (int y = 0; y < ch; y++) {
+            const uint8_t *src = (const uint8_t *)xi->data + (size_t)y * bpl;
+            uint8_t *out = dst + (size_t)y * w * 3;
+            for (int x = 0; x < cw; x++) {
+                out[0] = src[0];
+                out[1] = src[1];
+                out[2] = src[2];
+                src += 4;
+                out += 3;
+            }
+        }
+        return;
+    }
+    if (bpp == 24 && le && rm == 0x00ff0000ul && gm == 0x0000ff00ul &&
+        bm == 0x000000fful) {
+        for (int y = 0; y < ch; y++) {
+            const uint8_t *src = (const uint8_t *)xi->data + (size_t)y * bpl;
+            uint8_t *out = dst + (size_t)y * w * 3;
+            for (int x = 0; x < cw; x++) {
+                out[0] = src[2];
+                out[1] = src[1];
+                out[2] = src[0];
+                src += 3;
+                out += 3;
+            }
+        }
+        return;
+    }
+
+    const int rs = x11MaskShift(rm), gs = x11MaskShift(gm), bs = x11MaskShift(bm);
+    const int step = bpp / 8;
+    if (step <= 0) return;
+    for (int y = 0; y < ch; y++) {
+        const uint8_t *src = (const uint8_t *)xi->data + (size_t)y * bpl;
+        uint8_t *out = dst + (size_t)y * w * 3;
+        for (int x = 0; x < cw; x++) {
+            const uint32_t p = x11ReadPixel(xi, src);
+            out[0] = (uint8_t)((p & rm) >> rs);
+            out[1] = (uint8_t)((p & gm) >> gs);
+            out[2] = (uint8_t)((p & bm) >> bs);
+            src += step;
+            out += 3;
+        }
+    }
+}
+
+/* XFixes cursor pixels are premultiplied ARGB in the low 32 bits of each
+ * unsigned long (64-bit on LP64). Hotspot is (x, y); the bitmap's origin
+ * is (x - xhot, y - yhot) in root coordinates, matching the capture. */
+static void x11CompositeCursor(uint8_t *dst, int w, int h)
+{
+    if (!g_x11_fixes) return;
+    XFixesCursorImage *cur = XFixesGetCursorImage(g_x11);
+    if (!cur || !cur->pixels) {
+        if (cur) XFree(cur);
+        return;
+    }
+    const int left = (int)cur->x - (int)cur->xhot - g_cap_x;
+    const int top  = (int)cur->y - (int)cur->yhot - g_cap_y;
+    if (!g_x11_cursor_logged) {
+        std::cout << "X11 cursor: " << cur->width << "x" << cur->height
+                  << " at " << (int)cur->x << "," << (int)cur->y << "\n";
+        g_x11_cursor_logged = true;
+    }
+    for (unsigned cy = 0; cy < cur->height; cy++) {
+        const int dy = top + (int)cy;
+        if (dy < 0 || dy >= h) continue;
+        for (unsigned cx = 0; cx < cur->width; cx++) {
+            const int dx = left + (int)cx;
+            if (dx < 0 || dx >= w) continue;
+            const unsigned long pix =
+                cur->pixels[(size_t)cy * cur->width + cx];
+            const unsigned a = (unsigned)((pix >> 24) & 0xffu);
+            if (a == 0) continue;
+            const unsigned sr = (unsigned)((pix >> 16) & 0xffu);
+            const unsigned sg = (unsigned)((pix >>  8) & 0xffu);
+            const unsigned sb = (unsigned)( pix        & 0xffu);
+            uint8_t *p = dst + ((size_t)dy * w + dx) * 3;
+            if (a == 255) {
+                p[0] = (uint8_t)sr;
+                p[1] = (uint8_t)sg;
+                p[2] = (uint8_t)sb;
+            } else {
+                const unsigned inv = 255u - a;
+                unsigned r = sr + (unsigned)p[0] * inv / 255u;
+                unsigned g = sg + (unsigned)p[1] * inv / 255u;
+                unsigned b = sb + (unsigned)p[2] * inv / 255u;
+                if (r > 255u) r = 255u;
+                if (g > 255u) g = 255u;
+                if (b > 255u) b = 255u;
+                p[0] = (uint8_t)r;
+                p[1] = (uint8_t)g;
+                p[2] = (uint8_t)b;
+            }
+        }
+    }
+    XFree(cur);
+}
+
 static std::vector<uint8_t> captureScreen()
 {
     std::vector<uint8_t> px(SCREEN_WIDTH * SCREEN_HEIGHT * BYTES_PER_PIXEL, 0);
-    Display *dpy = XOpenDisplay(nullptr);
-    if (!dpy) return px;
-    Window root = RootWindow(dpy, DefaultScreen(dpy));
-    XImage *xi  = XGetImage(dpy, root, 0, 0,
-                             SCREEN_WIDTH, SCREEN_HEIGHT, AllPlanes, ZPixmap);
-    if (!xi) { XCloseDisplay(dpy); return px; }
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-            unsigned long p = XGetPixel(xi, x, y);
-            size_t i = ((size_t)y * SCREEN_WIDTH + x) * 3;
-            px[i+0] = (uint8_t)((p >> 16) & 0xFF); /* R */
-            px[i+1] = (uint8_t)((p >>  8) & 0xFF); /* G */
-            px[i+2] = (uint8_t)( p        & 0xFF); /* B */
+    if (SCREEN_WIDTH <= 0 || SCREEN_HEIGHT <= 0) return px;
+    if (g_wl_active) {
+        if (!wlCaptureFrame(px.data(), SCREEN_WIDTH, SCREEN_HEIGHT))
+            g_capture_ok = false;
+        return px;
+    }
+    if (!x11Ensure(SCREEN_WIDTH, SCREEN_HEIGHT)) {
+        g_capture_ok = false;
+        return px;
+    }
+
+    const Window root = RootWindow(g_x11, DefaultScreen(g_x11));
+    XImage *xi = nullptr;
+    bool owned = false;
+    if (g_x11_shm_ok && g_x11_shm_image) {
+        /* A size mismatch is a BadMatch, delivered asynchronously. Trap it
+         * so we fall back to XGetImage instead of aborting the process. */
+        g_x11_trap = 0;
+        XErrorHandler prev = XSetErrorHandler(x11ErrorTrap);
+        const Bool got = XShmGetImage(g_x11, root, g_x11_shm_image,
+                                      g_cap_x, g_cap_y, AllPlanes);
+        if (!got || g_x11_trap) XSync(g_x11, False);
+        XSetErrorHandler(prev);
+        if (!got || g_x11_trap) {
+            x11DestroyShm();
+            g_x11_shm_tried = true;
+        } else {
+            xi = g_x11_shm_image;
         }
     }
-    XDestroyImage(xi);
-    XCloseDisplay(dpy);
+    if (!xi) {
+        xi = XGetImage(g_x11, root, g_cap_x, g_cap_y,
+                       (unsigned)SCREEN_WIDTH, (unsigned)SCREEN_HEIGHT,
+                       AllPlanes, ZPixmap);
+        owned = true;
+    }
+    if (!xi) {
+        g_capture_ok = false;
+        return px;
+    }
+
+    if (!g_x11_logged) {
+        std::cout << "X11 capture: " << xi->width << "x" << xi->height
+                  << " at " << g_cap_x << "," << g_cap_y
+                  << (owned ? " XGetImage" : " MIT-SHM")
+                  << " " << xi->bits_per_pixel << "bpp"
+                  << std::hex
+                  << " masks r=" << xi->red_mask
+                  << " g=" << xi->green_mask
+                  << " b=" << xi->blue_mask
+                  << std::dec
+                  << (g_x11_fixes ? " + XFixes cursor\n"
+                                  : " (XFixes cursor unavailable)\n");
+        g_x11_logged = true;
+    }
+    x11CopyImage(xi, px.data(), SCREEN_WIDTH, SCREEN_HEIGHT);
+    if (owned) XDestroyImage(xi);
+    x11CompositeCursor(px.data(), SCREEN_WIDTH, SCREEN_HEIGHT);
     return px;
 }
 #endif
@@ -467,7 +802,7 @@ static std::vector<uint8_t> captureScreen()
  * The virtual display is only attached to the desktop while an extend
  * streaming session is running.
  * ══════════════════════════════════════════════════════════════════════════ */
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
 
 /* Ask the user which resolution the virtual display should use.
  * Modes mirror the driver's vdd_settings.xml. Default: 1920x1080. */
@@ -489,8 +824,12 @@ static void selectExtendResolution(int &w, int &h)
     for (int i = 0; i < nModes; i++)
         std::cout << "  " << (i == 0 ? COL_GREEN : COL_YELLOW) << (i + 1)
                   << COL_RESET << "  " << modes[i].label << "\n";
+#ifdef _WIN32
     std::cout << "  (resolution can also be changed later in Windows "
                  "display settings – the stream adapts automatically)\n";
+#else
+    std::cout << "  (the virtual output is placed to the right of the primary)\n";
+#endif
     std::cout << COL_BOLD << "  Choice [1]: " << COL_RESET;
 
     std::string line;
@@ -509,7 +848,7 @@ static void selectExtendResolution(int &w, int &h)
     std::cout << COL_GREEN << "  Resolution: " << w << "x" << h << "\n"
               << COL_RESET;
 }
-#endif /* _WIN32 */
+#endif /* _WIN32 || __linux__ */
 
 /* ══════════════════════════════════════════════════════════════════════════
  * DISPLAY MODE SELECTION
@@ -525,6 +864,11 @@ static uint32_t selectDisplayMode()
               << "  " << COL_GREEN << "2" << COL_RESET
                       << "  Extend        (real 2nd desktop – virtual display is\n"
                       << "                   attached automatically for the session)\n"
+#elif defined(__linux__)
+              << "  " << COL_GREEN << "2" << COL_RESET
+                      << "  Extend        (2nd desktop via xrandr VIRTUAL*, Sway,\n"
+                      << "                   or Hyprland; GNOME Wayland needs a\n"
+                      << "                   VIRTUAL connector you install yourself)\n"
 #endif
               << COL_BOLD << "  Choice [1]: " << COL_RESET;
 
@@ -533,6 +877,15 @@ static uint32_t selectDisplayMode()
 
 #ifdef _WIN32
     if (line == "2") return MODE_TRUE_EXTEND;
+#elif defined(__linux__)
+    if (line == "2" || line == "extend") return MODE_TRUE_EXTEND;
+#else
+    if (line == "2" || line == "extend") {
+        std::cerr << COL_YELLOW
+                  << "  Extend is not available on macOS (no virtual display). "
+                     "Staying on mirror.\n"
+                  << COL_RESET;
+    }
 #endif
     return MODE_MIRROR;             /* default */
 }
@@ -987,6 +1340,68 @@ static void consoleCtrlHandler(int)
 }
 #endif
 
+#ifdef __linux__
+static void linuxCleanup()
+{
+    wlCaptureShutdown();
+    linuxVddShutdown();
+    x11CaptureShutdown();
+}
+
+/* Open the capture source before the handshake so a missing screen is an
+ * error instead of a stream of black frames. Wayland is attempted only
+ * when WAYLAND_DISPLAY is set; failure falls back to X11 unless the
+ * virtual output lives in the compositor (Sway / Hyprland), where the
+ * XWayland root is not that output. */
+static bool prepareLinuxCapture(std::string &err)
+{
+    const char *wl = std::getenv("WAYLAND_DISPLAY");
+    const bool wayland = wl && wl[0];
+    const bool extend = DISPLAY_MODE == MODE_TRUE_EXTEND;
+    const bool compositor = extend && !g_vdd_backend.empty() &&
+                            g_vdd_backend != "xrandr";
+
+    if (wayland) {
+        WlCaptureRequest req;
+        req.want_w = extend ? SCREEN_WIDTH : 0;
+        req.want_h = extend ? SCREEN_HEIGHT : 0;
+        req.multiple = extend;
+        req.include_virtual = extend;
+        WlCaptureInfo info;
+        std::string werr;
+        if (wlCaptureStart(req, info, werr)) {
+            if (!extend && info.width > 0 && info.height > 0) {
+                SCREEN_WIDTH = info.width;
+                SCREEN_HEIGHT = info.height;
+            }
+            g_wl_active = true;
+            std::cout << "Wayland capture: xdg-desktop-portal "
+                      << info.width << "x" << info.height << "\n";
+            return true;
+        }
+        std::cerr << COL_YELLOW
+                  << "Wayland capture unavailable (" << werr << ").\n"
+                  << "Falling back to X11/XWayland.\n" << COL_RESET;
+        if (compositor) {
+            err = "Sway/Hyprland extend needs the portal screen cast of the "
+                  "new output. " + werr;
+            return false;
+        }
+    }
+    if (!x11Ensure(SCREEN_WIDTH, SCREEN_HEIGHT)) {
+        err = wayland
+                  ? "No X11 display and Wayland capture failed. Capture is unavailable."
+                  : "X11 open failed. Capture is unavailable.";
+        return false;
+    }
+    if (wayland) {
+        std::cout << "Capture: X11/XWayland fallback "
+                     "(unset WAYLAND_DISPLAY to skip the portal)\n";
+    }
+    return true;
+}
+#endif
+
 int main(int argc, char* argv[])
 {
 #ifdef _WIN32
@@ -1021,6 +1436,11 @@ int main(int argc, char* argv[])
 #else
     signal(SIGINT, consoleCtrlHandler);
     signal(SIGTERM, consoleCtrlHandler);
+#  ifdef __linux__
+    /* linuxCleanup is idempotent and covers portal, virtual output and X11
+     * on every return, including paths that return before the explicit call. */
+    atexit(linuxCleanup);
+#  endif
 #endif
 
     /* Discover receivers (or use direct IP from command line).
@@ -1029,7 +1449,10 @@ int main(int argc, char* argv[])
      *          [--bitrate <kbps>] [--quality <0-51>] [--fps <n>]
      *          [--scale <pct>] [--chroma 420|444]
      *   --mode is non-interactive (GUI/automation): skips the prompts
-     *   and, for extend, uses the default 1920x1080 virtual display. */
+     *   and, for extend, uses the default 1920x1080 virtual display.
+     *   --mode extend is refused on macOS (extend_unsupported). On Linux
+     *   it enables a virtual output or exits with vdd_unavailable — mode=1
+     *   is never sent unless that output is actually up. */
     std::string cli_mode;                       /* empty = ask interactively */
     std::string cli_ip;
     std::string cli_codec = "h264";
@@ -1065,6 +1488,21 @@ int main(int argc, char* argv[])
         }
     }
     g_codec = codecFromString(cli_codec);   /* "auto" → CODEC_H264 */
+
+#ifdef __APPLE__
+    /* No virtual display on macOS. Fail before discovery so a scripted
+     * --mode extend cannot sit in SSDP and then handshake mode=1. */
+    if (cli_mode == "extend") {
+        std::cerr << COL_RED
+                  << "Extend mode is not available on macOS: there is no "
+                     "virtual display.\n"
+                  << "Refusing --mode extend (no mode=1 handshake).\n"
+                  << COL_RESET;
+        emitStatError("extend_unsupported");
+        cleanupSockets();
+        return 1;
+    }
+#endif
 
     std::vector<DiscoveredDevice> receivers;
     if (!cli_ip.empty()) {
@@ -1113,10 +1551,25 @@ int main(int argc, char* argv[])
     std::cout << COL_GREEN << "Selected: " << sel.toString()
               << COL_RESET << "\n";
 
-    /* Choose display mode (CLI --mode skips the prompt) */
-    if (cli_mode == "extend")      DISPLAY_MODE = MODE_TRUE_EXTEND;
-    else if (cli_mode == "mirror") DISPLAY_MODE = MODE_MIRROR;
-    else                           DISPLAY_MODE = selectDisplayMode();
+    /* Choose display mode (CLI --mode skips the prompt). macOS already
+     * returned above. Linux still has to bring a virtual output up before
+     * mode=1 is allowed onto the wire. */
+    if (cli_mode == "extend") {
+#ifdef __APPLE__
+        std::cerr << COL_RED
+                  << "Extend mode is not available on macOS (no mode=1 handshake).\n"
+                  << COL_RESET;
+        emitStatError("extend_unsupported");
+        cleanupSockets();
+        return 1;
+#else
+        DISPLAY_MODE = MODE_TRUE_EXTEND;
+#endif
+    } else if (cli_mode == "mirror") {
+        DISPLAY_MODE = MODE_MIRROR;
+    } else {
+        DISPLAY_MODE = selectDisplayMode();
+    }
     const char *modeLabel =
         DISPLAY_MODE == MODE_TRUE_EXTEND ? "Extend" : "Mirror";
     std::cout << COL_GREEN << "Mode: " << modeLabel << COL_RESET << "\n";
@@ -1138,6 +1591,35 @@ int main(int argc, char* argv[])
         g_cap_origin.y = vdd.y;
         SCREEN_WIDTH   = vdd.w;
         SCREEN_HEIGHT  = vdd.h;
+    }
+#elif defined(__linux__)
+    if (DISPLAY_MODE == MODE_TRUE_EXTEND) {
+        int vdd_w = 1920, vdd_h = 1080;
+        if (cli_mode.empty()) selectExtendResolution(vdd_w, vdd_h);
+        LinuxVddInfo vdd;
+        std::string verr;
+        if (!linuxVddStartup(vdd_w, vdd_h, vdd, verr)) {
+            std::cerr << COL_RED << "Extend mode needs a virtual output.\n"
+                      << verr << "\n"
+                      << "Refusing to handshake mode=1.\n" << COL_RESET;
+            emitStatError("vdd_unavailable");
+            cleanupSockets();
+            return 1;
+        }
+        g_vdd_backend  = vdd.backend;
+        g_cap_x        = vdd.x;
+        g_cap_y        = vdd.y;
+        SCREEN_WIDTH   = vdd.w;
+        SCREEN_HEIGHT  = vdd.h;
+    }
+    {
+        std::string cerr_cap;
+        if (!prepareLinuxCapture(cerr_cap)) {
+            std::cerr << COL_RED << cerr_cap << "\n" << COL_RESET;
+            emitStatError("capture_unavailable");
+            cleanupSockets();
+            return 1;
+        }
     }
 #endif
 
@@ -1463,6 +1945,15 @@ int main(int argc, char* argv[])
 #endif
 
         auto frame = captureScreen();
+#ifdef __linux__
+        if (!g_capture_ok) {
+            std::cerr << COL_RED
+                      << "Capture failed; stopping without sending black frames\n"
+                      << COL_RESET;
+            emitStatError("capture_unavailable");
+            break;
+        }
+#endif
 
         if (isCodedCodec()) {
             /* Coded: one access unit per frame, framed like any DATA packet */
@@ -1580,6 +2071,8 @@ int main(int argc, char* argv[])
     if (PORTS_SOCK_VALID(g_ports_sock)) ports_remote_disconnect(g_ports_sock);
 #ifdef _WIN32
     vddShutdown();   /* detach the virtual display if we attached it */
+#elif defined(__linux__)
+    linuxCleanup();
 #endif
     cleanupSockets();
     return 0;

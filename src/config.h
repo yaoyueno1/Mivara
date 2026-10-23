@@ -20,7 +20,7 @@ struct AppConfig
     std::string chroma = "420";      /* 420|444 */
     int show_status_console = 0;     /* 1 = classic cmd console for children */
     int show_log_window = 0;         /* 1 = auto-open the log window */
-    int auto_start = 0;              /* 1 = launch at logon (Task Scheduler) */
+    int auto_start = 0;              /* 1 = launch at logon (Windows task / Linux autostart desktop) */
     int auto_receive = 0;            /* 1 = enter receive mode on app open */
     int auto_check_update = 1;       /* 1 = check for updates on app open */
     std::string theme = "system";    /* light|dark|system (GUI appearance) */

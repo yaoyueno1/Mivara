@@ -71,10 +71,23 @@ ifeq ($(UNAME_S),Linux)
 
     CXXFLAGS += -D_REENTRANT
     NET_LIBS := -lpthread
-    SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lX11
+    # Xfixes: cursor image. Xext: MIT-SHM. X11: display connection.
+    SENDER_LIBS   := $(NET_LIBS) $(OPT_FLAGS) -lXfixes -lXext -lX11
     RECEIVER_LIBS := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
     APP_LIBS      := $(SDL_LIBS) $(NET_LIBS) $(OPT_FLAGS)
     RES_ADMIN     :=
+    # Wayland portal capture. Optional: without these, sender still builds
+    # and falls back to X11 with a log line naming the missing libraries.
+    ifneq ($(shell pkg-config --exists libpipewire-0.3 dbus-1 2>/dev/null && echo 1),)
+        PW_CFLAGS := $(shell pkg-config --cflags libpipewire-0.3 dbus-1) -DMIVARA_HAS_PIPEWIRE
+        PW_LIBS   := $(shell pkg-config --libs libpipewire-0.3 dbus-1)
+    else
+        PW_CFLAGS :=
+        PW_LIBS   :=
+    endif
+    SENDER_LIBS += $(PW_LIBS)
+    OBJ_WL := $(BUILDDIR)/wl_capture.o
+    OBJ_VDD_LINUX := $(BUILDDIR)/vdd_linux.o
 endif
 
 # --------------------------------------------------------------------------
@@ -216,6 +229,11 @@ $(OBJ_APP) $(OBJ_RECEIVER) $(OBJ_THEME): CXXFLAGS += $(SDL_CFLAGS)
 # codec.o needs FFmpeg headers
 $(OBJ_CODEC): CXXFLAGS += $(FFMPEG_CFLAGS)
 
+# PipeWire / dbus headers only on the Wayland capture object (sender).
+ifneq ($(OBJ_WL),)
+$(OBJ_WL): CXXFLAGS += $(PW_CFLAGS)
+endif
+
 # Header Change Tracking Maps
 $(OBJ_DISCOVER): $(SRCDIR)/discover.h
 $(OBJ_PORTS): $(SRCDIR)/ports.h
@@ -226,15 +244,19 @@ $(OBJ_CONFIG): $(SRCDIR)/config.h
 $(OBJ_HISTORY): $(SRCDIR)/history.h
 $(OBJ_UPDATE): $(SRCDIR)/update.h $(SRCDIR)/version.h
 $(OBJ_THEME): $(SRCDIR)/theme.h
-$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/version.h
+ifneq ($(OBJ_WL),)
+$(OBJ_WL): $(SRCDIR)/wl_capture.h
+$(OBJ_VDD_LINUX): $(SRCDIR)/vdd_linux.h
+endif
+$(OBJ_SENDER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/vdd.h $(SRCDIR)/vdd_linux.h $(SRCDIR)/wl_capture.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/version.h
 $(OBJ_RECEIVER): $(SRCDIR)/discover.h $(SRCDIR)/gpu_accelerate.h $(SRCDIR)/ports.h $(SRCDIR)/codec.h $(SRCDIR)/proto.h $(SRCDIR)/version.h
-$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h
+$(OBJ_APP): $(SRCDIR)/discover.h $(SRCDIR)/vdd.h $(SRCDIR)/vdd_linux.h $(SRCDIR)/config.h $(SRCDIR)/history.h $(SRCDIR)/update.h $(SRCDIR)/version.h $(SRCDIR)/theme.h
 
 # ============================================================================
 # TARGET LINKING
 # ============================================================================
 
-$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(RES_ADMIN) | $(BINDIR)
+$(SENDER_BIN): $(OBJ_SENDER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_VDD) $(OBJ_CODEC) $(OBJ_WL) $(OBJ_VDD_LINUX) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(SENDER_LIBS)
 	@echo "Built $(SENDER_BIN)"
 
@@ -242,7 +264,7 @@ $(RECEIVER_BIN): $(OBJ_RECEIVER) $(OBJ_DISCOVER) $(OBJ_GPU) $(OBJ_PORTS) $(OBJ_C
 	$(CXX) $^ -o $@ $(RECEIVER_LIBS)
 	@echo "Built $(RECEIVER_BIN)"
 
-$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_CONFIG) $(OBJ_HISTORY) $(OBJ_UPDATE) $(OBJ_THEME) $(RES_ADMIN) | $(BINDIR)
+$(APP_BIN): $(OBJ_APP) $(OBJ_DISCOVER) $(OBJ_VDD) $(OBJ_VDD_LINUX) $(OBJ_CONFIG) $(OBJ_HISTORY) $(OBJ_UPDATE) $(OBJ_THEME) $(RES_ADMIN) | $(BINDIR)
 	$(CXX) $^ -o $@ $(APP_LIBS)
 	@echo "Built $(APP_BIN)"
 
@@ -333,21 +355,39 @@ check:
     else \
         echo "    NOT FOUND  SDL2_ttf  <-- required for the GUI (app)"; \
     fi
+	@if [ "$(PLATFORM)" = "linux" ]; then \
+        echo "  X11 capture headers:"; \
+        for h in X11/Xlib.h X11/extensions/XShm.h X11/extensions/Xfixes.h; do \
+            if [ -f /usr/include/$$h ]; then echo "    OK  $$h"; \
+            else echo "    NOT FOUND  $$h  <-- Linux sender"; fi; \
+        done; \
+        if pkg-config --exists libpipewire-0.3 dbus-1 2>/dev/null; then \
+            echo "    OK  libpipewire-0.3 + dbus-1 (Wayland portal capture)"; \
+        else \
+            echo "    NOT FOUND  libpipewire-0.3 / dbus-1  (Wayland capture will fall back to X11)"; \
+        fi; \
+    fi
 	@echo "========================================="
 
 install-deps:
 	@echo "Installing dependencies..."
 	@if command -v apt-get >/dev/null 2>&1; then \
         sudo apt-get update && \
-        sudo apt-get install -y g++ make libx11-dev libsdl2-dev libsdl2-ttf-dev \
-            libavcodec-dev libavutil-dev libswscale-dev; \
+        sudo apt-get install -y g++ make libx11-dev libxext-dev libxfixes-dev \
+            libsdl2-dev libsdl2-ttf-dev \
+            libavcodec-dev libavutil-dev libswscale-dev \
+            libpipewire-0.3-dev libdbus-1-dev \
+            fonts-wqy-microhei; \
 	elif command -v dnf >/dev/null 2>&1; then \
-        sudo dnf install -y gcc-c++ make libX11-devel SDL2-devel SDL2_ttf-devel \
+        sudo dnf install -y gcc-c++ make libX11-devel libXext-devel libXfixes-devel \
+            SDL2-devel SDL2_ttf-devel pipewire-devel dbus-devel wqy-microhei-fonts \
             ffmpeg-free-devel || sudo dnf install -y gcc-c++ make libX11-devel \
-            SDL2-devel SDL2_ttf-devel ffmpeg-devel; \
+            libXext-devel libXfixes-devel SDL2-devel SDL2_ttf-devel \
+            pipewire-devel dbus-devel wqy-microhei-fonts ffmpeg-devel; \
 	elif command -v yum >/dev/null 2>&1; then \
-        sudo yum install -y gcc-c++ make libX11-devel SDL2-devel SDL2_ttf-devel \
-            ffmpeg-devel; \
+        sudo yum install -y gcc-c++ make libX11-devel libXext-devel libXfixes-devel \
+            SDL2-devel SDL2_ttf-devel pipewire-devel dbus-devel \
+            wqy-microhei-fonts ffmpeg-devel; \
 	elif command -v pacman >/dev/null 2>&1; then \
         if [ -n "$$MINGW_PACKAGE_PREFIX" ]; then \
             pacman -S --needed --noconfirm \
@@ -357,14 +397,17 @@ install-deps:
                 "$${MINGW_PACKAGE_PREFIX}-SDL2_ttf" \
                 "$${MINGW_PACKAGE_PREFIX}-ffmpeg"; \
         else \
-            sudo pacman -S --needed --noconfirm gcc make libx11 sdl2 sdl2_ttf ffmpeg; \
+            sudo pacman -S --needed --noconfirm gcc make libx11 libxext libxfixes \
+                sdl2 sdl2_ttf ffmpeg pipewire dbus wqy-microhei; \
         fi; \
 	elif command -v brew >/dev/null 2>&1; then \
         brew install sdl2 sdl2_ttf ffmpeg; \
 	else \
         echo "Unsupported package manager.  Install manually:"; \
         echo "  g++ / clang++ (C++17)"; \
-        echo "  libX11-dev  (Linux screen capture)"; \
+        echo "  libX11-dev libXext-dev libXfixes-dev  (Linux screen capture + cursor)"; \
+        echo "  libpipewire-0.3-dev libdbus-1-dev  (Wayland portal capture; optional)"; \
+        echo "  fonts-wqy-microhei / wqy-microhei-fonts / wqy-microhei  (GUI CJK)"; \
         echo "  libSDL2-dev"; \
         echo "  libSDL2-ttf-dev  (GUI launcher)"; \
         echo "  libavcodec-dev libavutil-dev libswscale-dev  (H.264/H.265/AV1)"; \
@@ -396,3 +439,4 @@ help:
 	@echo "SENDER CLI:"
 	@echo "  bin/sender [ip] [port] [--mode mirror|extend]"
 	@echo "    --mode skips all interactive prompts (used by the GUI)"
+	@echo "    --mode extend: Windows MttVDD; Linux xrandr VIRTUAL / Sway / Hyprland; macOS exits"
